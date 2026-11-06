@@ -45,6 +45,7 @@ cert example.com example.org
 | `-u`, `--utc` | 日時を UTC で表示する |
 | `-s`, `--timeout <秒>` | 接続と TLS ハンドシェイクを合わせたタイムアウト秒数。DNS の名前解決は含まない。0 は上限なし（既定: 3） |
 | `-r`, `--resolve <HOST:PORT:ADDR>` | 名前解決を上書きして ADDR に接続する（複数指定可。IPv6 は `[2001:db8::1]` のように角括弧で囲む） |
+| `--chain` | サーバーが送ってきた証明書チェーンをそのまま表示し、つながりと有効期間を検査する |
 | `-v`, `--version` | バージョンを表示する |
 
 形式を変える:
@@ -92,6 +93,50 @@ cert -r example.com:443:192.0.2.10 -r example.org:443:192.0.2.11 example.com exa
 ```
 warning: --resolve example.org:443:192.0.2.11 matched no host
 ```
+
+### --chain
+
+`--chain` を指定すると、サーバーが TLS ハンドシェイクで送ってきた証明書をすべて、送られた順（先頭がサーバー証明書）に表示し、チェーンを検査します。
+OS やブラウザは、サーバーが送らなかった中間証明書を自分で補って検証を通すことがあります。そのため、中間証明書が抜けていたり古いままだったりしても、手元では問題に気づけません。`--chain` は補完を行わず、サーバーが実際に送った内容だけを見ます。証明書を入れ替えたあとの確認に使えます。
+
+```
+cert --chain example.com
+```
+
+```
+DomainName:   example.com
+IP:           192.0.2.10
+Port:         443
+Issuer:       Example Intermediate CA
+Validation:   DV
+NotBefore:    2026-10-01 09:00:00 +0900 JST
+NotAfter:     2027-01-01 08:59:59 +0900 JST
+CommonName:   example.com
+SANs:         [example.com www.example.com]
+Error:        
+Chain:
+  [0] CN=example.com
+      Issuer:    CN=Example Intermediate CA
+      NotBefore: 2026-10-01 09:00:00 +0900 JST
+      NotAfter:  2027-01-01 08:59:59 +0900 JST
+      Serial:    0A1B2C3D
+      SHA256:    AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99
+  [1] CN=Example Intermediate CA
+      Issuer:    CN=Example Root CA
+      NotBefore: 2025-01-01 09:00:00 +0900 JST
+      NotAfter:  2030-01-01 08:59:59 +0900 JST
+      Serial:    01
+      SHA256:    99:88:77:66:55:44:33:22:11:00:FF:EE:DD:CC:BB:AA:99:88:77:66:55:44:33:22:11:00:FF:EE:DD:CC:BB:AA
+ChainCheck:   OK
+```
+
+`ChainCheck` は次の 2 点を検査し、`OK` か、見つかった問題をすべて並べた `NG: ...` を表示します。
+
+- 各証明書の発行者が、次の証明書の主体者と一致する（`[0] issuer does not match [1] subject`）
+- すべての証明書が現在の時刻で有効期間内にある（`[1] expired`、`[1] not yet valid`）
+
+末尾の証明書の発行者は検査しません。ルート証明書まで送るサーバーも問題にはなりません。ルートまで信頼できるかどうかは通常の検証（`-k` なし）が担い、`--chain` はその動作を変えません。
+NG でも終了コードは 0 のままです。JSON では `chain` と `chainCheck` が各行に加わり、エラー行にはどちらも付きません。
 
 ### JSON と jq
 

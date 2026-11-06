@@ -5,6 +5,7 @@ use x509_parser::oid_registry::asn1_rs::{Any, Tag};
 use x509_parser::parse_x509_certificate;
 use x509_parser::x509::X509Name;
 
+use crate::chain::ChainEntry;
 use crate::validation::{organization, validation_type};
 
 #[derive(serde::Serialize, Clone, Debug, Default)]
@@ -22,6 +23,10 @@ pub struct CertInfo {
     pub not_before: String,
     pub not_after: String,
     pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Vec<ChainEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_check: Option<String>,
 }
 
 pub fn format_time(t: Timestamp, utc: bool) -> String {
@@ -113,6 +118,8 @@ pub fn cert_info_from_der(
         not_before: format_time(to_timestamp(cert.validity().not_before)?, utc),
         not_after: format_time(to_timestamp(cert.validity().not_after)?, utc),
         error: String::new(),
+        chain: None,
+        chain_check: None,
     })
 }
 
