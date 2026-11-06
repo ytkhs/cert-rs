@@ -7,25 +7,33 @@ use std::time::Duration;
 use cert_rs::cert::{CertInfo, cert_info_from_der, error_info};
 use cert_rs::fetch::{Options, client_config, fetch_with_config};
 use cert_rs::output::{Format, render};
-use cert_rs::target::{Resolve, parse_resolve, split_host_port};
+use cert_rs::target::{Resolve, parse_resolve, split_host_port, unmatched_resolves};
 use clap::{ArgAction, Parser};
 use rustls::ClientConfig;
 
+/// Show TLS certificate details for one or more hosts.
 #[derive(Parser)]
 #[command(name = "cert", version, disable_version_flag = true)]
 struct Cli {
+    /// Output format
     #[arg(short = 'f', long, value_enum, default_value = "table")]
     format: Format,
+    /// Skip certificate chain and hostname verification (handshake signatures are still checked)
     #[arg(short = 'k', long)]
     skip_verify: bool,
+    /// Show times in UTC instead of local time
     #[arg(short = 'u', long)]
     utc: bool,
-    #[arg(short = 's', long, default_value_t = 3)]
+    /// Seconds allowed for connect and handshake combined, excluding DNS lookup; 0 means no limit
+    #[arg(short = 's', long, value_name = "SECONDS", default_value_t = 3)]
     timeout: u64,
-    #[arg(short = 'r', long, value_parser = parse_resolve)]
+    /// Connect to ADDR instead of resolving HOST for that HOST:PORT; repeatable, IPv6 ADDR in brackets
+    #[arg(short = 'r', long, value_name = "HOST:PORT:ADDR", value_parser = parse_resolve)]
     resolve: Vec<Resolve>,
+    /// Print version
     #[arg(short = 'v', long, action = ArgAction::Version)]
     version: Option<bool>,
+    /// Hosts to inspect: host, host:port, [IPv6]:port or https:// URL
     #[arg(value_name = "HOST")]
     hosts: Vec<String>,
 }
@@ -95,6 +103,15 @@ fn main() -> ExitCode {
     if cli.hosts.is_empty() {
         eprintln!("Input at least one domain name.");
         return ExitCode::from(1);
+    }
+
+    let targets: Vec<(String, String)> = cli
+        .hosts
+        .iter()
+        .filter_map(|h| split_host_port(h).ok())
+        .collect();
+    for r in unmatched_resolves(&cli.resolve, &targets) {
+        eprintln!("warning: --resolve {r} matched no host");
     }
 
     let opts = Options {

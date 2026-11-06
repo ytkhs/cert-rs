@@ -89,6 +89,81 @@ fn timeout_zero_and_huge_succeed() {
 }
 
 #[test]
+fn untrusted_without_k_shows_error_and_exits_0() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["-f", "json", &format!("localhost:{port}")]);
+    assert_eq!(rows.len(), 1);
+    let err = rows[0]["error"].as_str().unwrap();
+    assert!(err.contains("certificate"), "{err}");
+}
+
+#[test]
+fn unmatched_resolve_warns_once_on_stderr() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let target = format!("localhost:{port}");
+    let used = format!("localhost:{port}:127.0.0.1");
+    let base = cert()
+        .args(["-k", "-f", "json", "-r", &used, &target])
+        .assert()
+        .success()
+        .stderr("")
+        .get_output()
+        .stdout
+        .clone();
+    let out = cert()
+        .args([
+            "-k",
+            "-f",
+            "json",
+            "-r",
+            &used,
+            "-r",
+            "example.com:443:192.0.2.10",
+            &target,
+        ])
+        .assert()
+        .success()
+        .stderr("warning: --resolve example.com:443:192.0.2.10 matched no host\n")
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(base, out);
+}
+
+#[test]
+fn resolve_with_bad_port_is_rejected() {
+    cert()
+        .args(["-r", "example.com:0:192.0.2.10", "example.com"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn help_describes_options() {
+    let out = cert()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8(out).unwrap();
+    for phrase in [
+        "Output format",
+        "Skip certificate chain and hostname verification",
+        "Show times in UTC",
+        "0 means no limit",
+        "Connect to ADDR instead of resolving HOST",
+        "Print version",
+        "Hosts to inspect",
+    ] {
+        assert!(help.contains(phrase), "missing {phrase:?} in:\n{help}");
+    }
+}
+
+#[test]
 fn version() {
     let out = cert()
         .arg("-v")

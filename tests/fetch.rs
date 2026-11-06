@@ -148,3 +148,16 @@ fn huge_timeout_does_not_overflow() {
     options.timeout = Duration::from_secs(u64::MAX);
     assert!(fetch("127.0.0.1", &port, &options).is_ok());
 }
+
+#[test]
+fn hostname_mismatch_without_k_is_error() {
+    let (der, key) = make_cert(None, &[], false, &["other.example.com"]);
+    let config = config_trusting(&der);
+    let port = spawn_tls_server(der, key).to_string();
+    let mut options = opts(false);
+    options.resolve = vec![parse_resolve(&format!("www.example.com:{port}:127.0.0.1")).unwrap()];
+    let err = fetch_with_config("www.example.com", &port, &options, config)
+        .err()
+        .unwrap();
+    assert!(err.contains("certificate"), "{err}");
+}
