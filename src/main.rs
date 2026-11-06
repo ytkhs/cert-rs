@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cert_rs::cert::{CertInfo, cert_info_from_der, error_info};
-use cert_rs::chain::{chain_check_label, chain_entries, check_chain};
+use cert_rs::chain::{ChainEntry, chain_check_label, chain_entries, check_chain};
 use cert_rs::fetch::{Options, client_config, fetch_with_config};
 use cert_rs::output::{Format, render};
 use cert_rs::target::{Resolve, parse_resolve, split_host_port, unmatched_resolves};
@@ -72,9 +72,7 @@ fn inspect(
         return info;
     }
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
-    match chain_entries(&ders, utc)
-        .and_then(|entries| Ok((entries, check_chain(&ders, jiff::Timestamp::now())?)))
-    {
+    match entries_and_problems(&ders, utc) {
         Ok((entries, problems)) => CertInfo {
             chain: Some(entries),
             chain_check: Some(chain_check_label(&problems)),
@@ -87,6 +85,15 @@ fn inspect(
             ..info
         },
     }
+}
+
+fn entries_and_problems(
+    ders: &[&[u8]],
+    utc: bool,
+) -> Result<(Vec<ChainEntry>, Vec<String>), String> {
+    let entries = chain_entries(ders, utc)?;
+    let problems = check_chain(ders, jiff::Timestamp::now())?;
+    Ok((entries, problems))
 }
 
 /// Keeps file descriptors under a typical ulimit.

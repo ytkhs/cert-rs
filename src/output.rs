@@ -110,7 +110,13 @@ fn render_md(certs: &[CertInfo]) -> String {
                 .iter()
                 .flatten()
                 .enumerate()
-                .map(|(i, e)| format!("[{i}] {} (NotAfter: {})<br/>", e.subject, e.not_after))
+                .map(|(i, e)| {
+                    format!(
+                        "[{i}] {} (NotAfter: {})<br/>",
+                        e.subject.replace('*', "\\*"),
+                        e.not_after
+                    )
+                })
                 .collect();
             out.pop();
             out.push_str(&format!(
@@ -226,6 +232,53 @@ bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
         assert_eq!(
             render(&[chained()], Format::Json),
             r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":"","chain":[{"subject":"CN=a.example.com","issuer":"CN=Test CA","notBefore":"NB","notAfter":"NA","serial":"0A1B","sha256":"AA:BB"},{"subject":"CN=Test CA","issuer":"CN=Test Root","notBefore":"NB","notAfter":"NA","serial":"01","sha256":"AA:BB"}],"chainCheck":"NG: [1] expired"}]"#
+        );
+    }
+
+    fn chain_parse_failed() -> CertInfo {
+        CertInfo {
+            chain: Some(vec![]),
+            chain_check: Some("NG: bad der".into()),
+            ..dv()
+        }
+    }
+
+    #[test]
+    fn table_chain_parse_failure() {
+        assert_eq!(
+            render(&[chain_parse_failed()], Format::Table),
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \nChain:\nChainCheck:   NG: bad der\n\n\n"
+        );
+    }
+
+    #[test]
+    fn markdown_chain_parse_failure() {
+        assert_eq!(
+            render(&[chain_parse_failed()], Format::Md),
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> |  |  | NG: bad der\n\n"
+        );
+    }
+
+    #[test]
+    fn json_chain_parse_failure() {
+        assert_eq!(
+            render(&[chain_parse_failed()], Format::Json),
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":"","chain":[],"chainCheck":"NG: bad der"}]"#
+        );
+    }
+
+    #[test]
+    fn markdown_escapes_star_in_chain_subject() {
+        let c = CertInfo {
+            chain: Some(vec![entry("CN=*.example.com", "CN=Test CA", "01")]),
+            chain_check: Some("OK".into()),
+            ..dv()
+        };
+        assert_eq!(
+            render(&[c], Format::Md),
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> |  | [0] CN=\\*.example.com (NotAfter: NA)<br/> | OK\n\n"
         );
     }
 
