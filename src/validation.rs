@@ -5,6 +5,8 @@ use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::ParsedExtension;
 use x509_parser::oid_registry::{Oid, asn1_rs::oid};
 
+use crate::cert::attribute_string;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ValidationType {
     DV,
@@ -50,16 +52,20 @@ fn has_subject_attribute(cert: &X509Certificate, oid: &Oid) -> bool {
 fn organizations(cert: &X509Certificate) -> Vec<String> {
     cert.subject()
         .iter_organization()
-        .filter_map(|a| a.as_str().ok())
-        .map(str::to_owned)
+        .filter_map(|a| attribute_string(a.attr_value()))
         .collect()
+}
+
+// Same decoding as the displayed value, so an OV verdict always comes with an Organization.
+fn has_organization(cert: &X509Certificate) -> bool {
+    !organizations(cert).is_empty()
 }
 
 fn is_ev(cert: &X509Certificate) -> bool {
     if has_policy(cert, &CABF_EV) {
         return true;
     }
-    cert.subject().iter_organization().next().is_some()
+    has_organization(cert)
         && has_subject_attribute(cert, &BUSINESS_CATEGORY)
         && has_subject_attribute(cert, &SERIAL_NUMBER)
         && [
@@ -78,7 +84,7 @@ pub fn validation_type(cert: &X509Certificate) -> ValidationType {
         ValidationType::OV
     } else if has_policy(cert, &CABF_DV) {
         ValidationType::DV
-    } else if cert.subject().iter_organization().next().is_some() {
+    } else if has_organization(cert) {
         ValidationType::OV
     } else {
         ValidationType::DV

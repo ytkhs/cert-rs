@@ -54,3 +54,38 @@ fn error_info_shape() {
     assert!(e.sans.is_none());
     assert_eq!(e.port, "");
 }
+
+fn cert_with_names(cn: rcgen::DnValue, org: Option<rcgen::DnValue>) -> Vec<u8> {
+    let mut params = rcgen::CertificateParams::new(vec!["a.example.com".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    if let Some(org) = org {
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, org);
+    }
+    let key = rcgen::KeyPair::generate().unwrap();
+    params.self_signed(&key).unwrap().der().to_vec()
+}
+
+#[test]
+fn teletex_common_name_is_read() {
+    let cn = rcgen::DnValue::TeletexString("*.example.com".try_into().unwrap());
+    let der = cert_with_names(cn, None);
+    let info = cert_info_from_der(&der, "a.example.com", "192.0.2.1", "443", true).unwrap();
+    assert_eq!(info.common_name, "*.example.com");
+    assert_eq!(info.issuer, "*.example.com");
+    assert_eq!(info.validation_type, "DV");
+}
+
+#[test]
+fn bmp_organization_counts_as_ov_and_is_shown() {
+    let cn = rcgen::DnValue::BmpString("a.example.com".try_into().unwrap());
+    let org = rcgen::DnValue::BmpString("Acmé 株式会社".try_into().unwrap());
+    let der = cert_with_names(cn, Some(org));
+    let info = cert_info_from_der(&der, "a.example.com", "192.0.2.1", "443", true).unwrap();
+    assert_eq!(info.common_name, "a.example.com");
+    assert_eq!(info.validation_type, "OV");
+    assert_eq!(info.organization, "Acmé 株式会社");
+}
