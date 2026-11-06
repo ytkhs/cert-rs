@@ -1,5 +1,7 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cert_rs::cert::{CertInfo, cert_info_from_der, error_info};
@@ -53,6 +55,41 @@ fn inspect(
         .unwrap_or_else(|e| error_info(&host, e))
 }
 
+/// Keeps file descriptors under a typical ulimit.
+const MAX_PARALLEL: usize = 128;
+
+fn map_bounded<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    f: impl Fn(&T) -> R + Sync,
+    on_panic: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let mut indexed: Vec<(usize, R)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers.min(items.len()))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        let r = catch_unwind(AssertUnwindSafe(|| f(item)))
+                            .unwrap_or_else(|_| on_panic(item));
+                        done.push((i, r));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker panics are caught per item"))
+            .collect()
+    });
+    indexed.sort_unstable_by_key(|(i, _)| *i);
+    indexed.into_iter().map(|(_, r)| r).collect()
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.hosts.is_empty() {
@@ -67,25 +104,62 @@ fn main() -> ExitCode {
     };
     let config = client_config(cli.skip_verify);
 
-    let results: Vec<CertInfo> = std::thread::scope(|s| {
-        let handles: Vec<_> = cli
-            .hosts
-            .iter()
-            .map(|h| {
-                let (opts, config) = (&opts, &config);
-                s.spawn(move || inspect(h, opts, config, cli.utc))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .zip(&cli.hosts)
-            .map(|(h, input)| {
-                h.join()
-                    .unwrap_or_else(|_| error_info(input, "internal error"))
-            })
-            .collect()
-    });
+    let results: Vec<CertInfo> = map_bounded(
+        &cli.hosts,
+        MAX_PARALLEL,
+        |h| inspect(h, &opts, &config, cli.utc),
+        |h| error_info(h, "internal error"),
+    );
 
     print!("{}", render(&results, cli.format));
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn keeps_input_order() {
+        let items: Vec<usize> = (0..50).collect();
+        let out = map_bounded(&items, 4, |&i| i * 2, |_| usize::MAX);
+        assert_eq!(out, items.iter().map(|i| i * 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn never_exceeds_worker_limit() {
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..40).collect();
+        map_bounded(
+            &items,
+            3,
+            |_| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(5));
+                running.fetch_sub(1, Ordering::SeqCst);
+            },
+            |_| (),
+        );
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn panic_becomes_fallback_and_others_continue() {
+        let items = vec![1, 2, 3];
+        let out = map_bounded(
+            &items,
+            2,
+            |&i| {
+                if i == 2 {
+                    panic!("boom");
+                }
+                i
+            },
+            |&i| i * 100,
+        );
+        assert_eq!(out, vec![1, 200, 3]);
+    }
 }
