@@ -87,3 +87,39 @@ fn client_config_builds_both_modes() {
     assert!(client_config(false).is_ok());
     assert!(client_config(true).is_ok());
 }
+
+/// Sends a TLS record header promising a large handshake record, then one byte every
+/// 200 ms, so no single read ever times out.
+fn spawn_drip_server() -> u16 {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                if stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
+                    return;
+                }
+                loop {
+                    std::thread::sleep(Duration::from_millis(200));
+                    if stream.write_all(&[0]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn slow_drip_handshake_hits_overall_deadline() {
+    let port = spawn_drip_server().to_string();
+    let mut options = opts(true);
+    options.timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = fetch("127.0.0.1", &port, &options).err().unwrap();
+    assert!(err.contains("timed out"), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(1800));
+}
