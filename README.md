@@ -1,6 +1,6 @@
 # cert
 
-複数ホストの TLS 証明書を並列に取得し、発行者・有効期間・SAN などを一覧表示する CLI ツールです。
+複数ホストの TLS 証明書を並列に取得し、発行者・有効期間・SAN に加えて、証明書の種別（Validation: DV / OV / EV）と OV・EV の組織名（Organization）を一覧表示する CLI ツールです。
 証明書の期限確認や、DNS 切り替え前の新サーバーの確認に使えます。
 
 ## インストール
@@ -28,10 +28,10 @@ cert example.com example.org
 | オプション | 説明 |
 | --- | --- |
 | `-f`, `--format <table\|md\|json>` | 出力形式（既定: `table`） |
-| `-k`, `--skip-verify` | 証明書チェーンの検証を行わない |
+| `-k`, `--skip-verify` | 証明書チェーンとホスト名の検証を行わない（ハンドシェイクの署名は検証する） |
 | `-u`, `--utc` | 日時を UTC で表示する |
-| `-s`, `--timeout <秒>` | 全体のタイムアウト秒数（既定: 3） |
-| `-r`, `--resolve <HOST:PORT:ADDR>` | 名前解決を上書きして ADDR に接続する（複数指定可） |
+| `-s`, `--timeout <秒>` | 接続と TLS ハンドシェイクを合わせたタイムアウト秒数。DNS の名前解決は含まない。0 は上限なし（既定: 3） |
+| `-r`, `--resolve <HOST:PORT:ADDR>` | 名前解決を上書きして ADDR に接続する（複数指定可。IPv6 は `[2001:db8::1]` のように角括弧で囲む） |
 | `-v`, `--version` | バージョンを表示する |
 
 形式を変える:
@@ -62,10 +62,22 @@ DNS を切り替える前に、新サーバーが正しい証明書を返して�
 cert --resolve example.com:443:192.0.2.10 example.com
 ```
 
+IPv6 アドレスに向けるときは ADDR を角括弧で囲みます。
+
+```
+cert --resolve example.com:443:[2001:db8::1] example.com
+```
+
 複数指定もできます。
 
 ```
 cert -r example.com:443:192.0.2.10 -r example.org:443:192.0.2.11 example.com example.org
+```
+
+どのホストとも HOST:PORT が一致しない `--resolve` があると、標準エラー出力に警告を 1 行出します（標準出力は変わりません）。
+
+```
+warning: --resolve example.org:443:192.0.2.11 matched no host
 ```
 
 ### JSON と jq

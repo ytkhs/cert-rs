@@ -2,6 +2,7 @@
 name = "cert-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Show TLS certificate details for one or more hosts"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
