@@ -97,6 +97,10 @@ cert -f json example.com example.org | jq '.[] | select(.error != "")'
 - TLS 1.1 以前、および旧式の暗号スイートのみに対応した TLS 1.2 サーバーには接続できず、エラーになります。
 - `-format`、`-skip-verify` のようなハイフン 1 つの長いオプションは使えません。`-f` / `--format`、`-k` / `--skip-verify` のように指定してください。
 
+## 設計判断
+
+主な設計判断は [docs/adr](docs/adr/README.md) に記録しています。
+
 ## ライセンス
 
 MIT License。詳細は [LICENSE](LICENSE) を参照。
