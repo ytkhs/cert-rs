@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use cert_rs::fetch::{Options, client_config, fetch, fetch_with_config};
 use cert_rs::target::parse_resolve;
-use common::{closed_port, make_cert, spawn_silent_listener, spawn_tls_server};
+use common::{
+    closed_port, make_cert, spawn_silent_listener, spawn_tls_server, spawn_tls_server_reporting,
+};
 use rustls::pki_types::CertificateDer;
 
 fn opts(skip_verify: bool) -> Options {
@@ -50,8 +52,13 @@ fn untrusted_with_k_returns_chain() {
 fn trusted_root_succeeds() {
     let (der, key) = make_cert(None, &[], false, &["localhost"]);
     let config = config_trusting(&der);
-    let port = spawn_tls_server(der, key).to_string();
-    assert!(fetch_with_config("localhost", &port, &opts(false), config).is_ok());
+    let (port, completed) = spawn_tls_server_reporting(der, key);
+    let fetched = fetch_with_config("localhost", &port.to_string(), &opts(false), config);
+    assert!(fetched.is_ok());
+    assert!(
+        completed.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "server never saw the client Finished"
+    );
 }
 
 #[test]

@@ -90,6 +90,15 @@ pub fn make_cert(
 
 /// Serves TLS handshakes with the given certificate until the test process exits.
 pub fn spawn_tls_server(cert_der: Vec<u8>, key: KeyPair) -> u16 {
+    spawn_tls_server_reporting(cert_der, key).0
+}
+
+/// Like spawn_tls_server, but sends one message per connection whose server-side
+/// handshake completed.
+pub fn spawn_tls_server_reporting(
+    cert_der: Vec<u8>,
+    key: KeyPair,
+) -> (u16, std::sync::mpsc::Receiver<()>) {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
 
@@ -105,10 +114,12 @@ pub fn spawn_tls_server(cert_der: Vec<u8>, key: KeyPair) -> u16 {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let config = config.clone();
+            let completed_tx = completed_tx.clone();
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
                 let Ok(mut conn) = rustls::ServerConnection::new(config) else {
@@ -119,6 +130,7 @@ pub fn spawn_tls_server(cert_der: Vec<u8>, key: KeyPair) -> u16 {
                         return;
                     }
                 }
+                let _ = completed_tx.send(());
                 // Flush any post-handshake messages so the client sees a clean close.
                 let _ = conn.complete_io(&mut stream);
                 conn.send_close_notify();
@@ -126,7 +138,7 @@ pub fn spawn_tls_server(cert_der: Vec<u8>, key: KeyPair) -> u16 {
             });
         }
     });
-    port
+    (port, completed_rx)
 }
 
 /// Accepts connections but never writes a byte, to exercise handshake timeouts.

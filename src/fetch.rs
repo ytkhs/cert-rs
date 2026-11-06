@@ -74,7 +74,9 @@ fn fetch_from_addrs(
         .map_err(|e| format!("failed to start TLS session: {e}"))?;
     // Not complete_io: it keeps reading until the handshake ends, so a peer that
     // trickles bytes would never give control back to check the deadline.
-    while conn.is_handshaking() {
+    // Not is_handshaking() alone: in TLS 1.3 it turns false while the client
+    // Finished is still buffered, so the server would never see it.
+    while conn.is_handshaking() || conn.wants_write() {
         let remaining =
             remaining(deadline).ok_or_else(|| format!("TLS handshake with {target} timed out"))?;
         stream
@@ -99,6 +101,8 @@ fn fetch_from_addrs(
                 let _ = conn.write_tls(&mut stream);
                 return Err(format!("TLS handshake with {target} failed: {e}"));
             }
+        } else {
+            return Err(format!("TLS handshake with {target} stalled"));
         }
     }
 
