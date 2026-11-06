@@ -13,8 +13,19 @@ pub fn render(certs: &[CertInfo], format: Format) -> String {
     match format {
         Format::Table => render_table(certs),
         Format::Md => render_md(certs),
-        Format::Json => serde_json::to_string(certs).expect("CertInfo is always serializable"),
+        Format::Json => render_json(certs),
     }
+}
+
+// Escape HTML-sensitive characters and line separators; they can only appear inside string literals.
+fn render_json(certs: &[CertInfo]) -> String {
+    serde_json::to_string(certs)
+        .expect("CertInfo is always serializable")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn sans_list(c: &CertInfo) -> String {
@@ -120,5 +131,12 @@ bad.example |  |  |  |  |  |  |  |  |  | boom\n\n");
     fn json() {
         assert_eq!(render(&[dv(), err()], Format::Json),
 r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":""},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","error":"boom"}]"#);
+    }
+
+    #[test]
+    fn json_escapes_html_and_line_separators() {
+        let c = CertInfo { organization: "A&B <C>\u{2028}\u{2029}".into(), ..ok() };
+        assert!(render(&[c], Format::Json)
+            .contains(r#""organization":"A\u0026B \u003cC\u003e\u2028\u2029""#));
     }
 }
