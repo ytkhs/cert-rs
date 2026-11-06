@@ -239,3 +239,23 @@ fn serial_is_uppercase_hex_without_separators() {
     assert!(!entries[0].serial.contains(':'));
     assert_eq!(entries[0].serial, entries[0].serial.to_uppercase());
 }
+
+#[test]
+fn validity_bounds_are_inclusive() {
+    let cert = issue("www.example.com", false, VALID, None);
+    let ders = [cert.der()];
+    let not_before: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+    let not_after: Timestamp = "2027-01-01T00:00:00Z".parse().unwrap();
+    assert!(check_chain(&refs(&ders), not_before).unwrap().is_empty());
+    assert!(check_chain(&refs(&ders), not_after).unwrap().is_empty());
+}
+
+#[test]
+fn serial_keeps_leading_nibble_zero_of_known_value() {
+    let mut params = rcgen::CertificateParams::new(vec!["a.example.com".to_string()]).unwrap();
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x0A, 0x1B, 0x2C]));
+    let key = rcgen::KeyPair::generate().unwrap();
+    let der = params.self_signed(&key).unwrap().der().to_vec();
+    let entries = chain_entries(&[der.as_slice()], true).unwrap();
+    assert_eq!(entries[0].serial, "0A1B2C");
+}
