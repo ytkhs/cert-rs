@@ -159,3 +159,42 @@ pub fn closed_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
+
+pub struct Issued {
+    pub params: CertificateParams,
+    pub cert: rcgen::Certificate,
+    pub key: KeyPair,
+}
+
+impl Issued {
+    pub fn der(&self) -> Vec<u8> {
+        self.cert.der().to_vec()
+    }
+}
+
+/// `validity` is ((y, m, d), (y, m, d)) for NotBefore and NotAfter.
+/// Signed by `issuer` when given, otherwise self-signed.
+pub fn issue(
+    cn: &str,
+    is_ca: bool,
+    validity: ((i32, u8, u8), (i32, u8, u8)),
+    issuer: Option<&Issued>,
+) -> Issued {
+    let mut params = CertificateParams::new(vec![cn.to_string()]).unwrap();
+    params.distinguished_name.push(DnType::CommonName, cn);
+    if is_ca {
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    }
+    let ((y1, m1, d1), (y2, m2, d2)) = validity;
+    params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+    params.not_after = rcgen::date_time_ymd(y2, m2, d2);
+    let key = KeyPair::generate().unwrap();
+    let cert = match issuer {
+        Some(i) => {
+            let issuer = rcgen::Issuer::new(i.params.clone(), &i.key);
+            params.clone().signed_by(&key, &issuer).unwrap()
+        }
+        None => params.clone().self_signed(&key).unwrap(),
+    };
+    Issued { params, cert, key }
+}
