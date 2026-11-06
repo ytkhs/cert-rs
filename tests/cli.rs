@@ -156,6 +156,7 @@ fn help_describes_options() {
         "Show times in UTC",
         "0 means no limit",
         "Connect to ADDR instead of resolving HOST",
+        "Show the certificates exactly as the server sent them",
         "Print version",
         "Hosts to inspect",
     ] {
@@ -199,4 +200,36 @@ fn live_sites() {
         .map(|r| r["validationType"].as_str().unwrap())
         .collect();
     assert_eq!(types, ["DV", "OV", "EV"]);
+}
+
+#[test]
+fn chain_flag_adds_chain_to_json() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["--chain", "-k", "-f", "json", &format!("localhost:{port}")]);
+    assert_eq!(rows[0]["chainCheck"], "OK");
+    assert_eq!(rows[0]["chain"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn chain_is_absent_without_flag() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["-k", "-f", "json", &format!("localhost:{port}")]);
+    assert!(rows[0].get("chain").is_none());
+    assert!(rows[0].get("chainCheck").is_none());
+}
+
+#[test]
+fn chain_is_not_added_to_error_rows() {
+    let rows = json_rows(&[
+        "--chain",
+        "-f",
+        "json",
+        "-s",
+        "1",
+        &format!("127.0.0.1:{}", closed_port()),
+    ]);
+    assert!(rows[0].get("chain").is_none());
+    assert!(rows[0].get("chainCheck").is_none());
 }

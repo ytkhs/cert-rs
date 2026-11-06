@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cert_rs::cert::{CertInfo, cert_info_from_der, error_info};
+use cert_rs::chain::{chain_check_label, chain_entries, check_chain};
 use cert_rs::fetch::{Options, client_config, fetch_with_config};
 use cert_rs::output::{Format, render};
 use cert_rs::target::{Resolve, parse_resolve, split_host_port, unmatched_resolves};
@@ -30,6 +31,9 @@ struct Cli {
     /// Connect to ADDR instead of resolving HOST for that HOST:PORT; repeatable, IPv6 ADDR in brackets
     #[arg(short = 'r', long, value_name = "HOST:PORT:ADDR", value_parser = parse_resolve)]
     resolve: Vec<Resolve>,
+    /// Show the certificates exactly as the server sent them and check their links and validity
+    #[arg(long)]
+    chain: bool,
     /// Print version
     #[arg(short = 'v', long, action = ArgAction::Version)]
     version: Option<bool>,
@@ -43,6 +47,7 @@ fn inspect(
     opts: &Options,
     config: &Result<Arc<ClientConfig>, String>,
     utc: bool,
+    chain: bool,
 ) -> CertInfo {
     let (host, port) = match split_host_port(input) {
         Ok(hp) => hp,
@@ -59,8 +64,29 @@ fn inspect(
     let Some(leaf) = fetched.chain.first() else {
         return error_info(&host, "no certificate presented");
     };
-    cert_info_from_der(leaf, &host, &fetched.ip, &port, utc)
-        .unwrap_or_else(|e| error_info(&host, e))
+    let info = match cert_info_from_der(leaf, &host, &fetched.ip, &port, utc) {
+        Ok(info) => info,
+        Err(e) => return error_info(&host, e),
+    };
+    if !chain {
+        return info;
+    }
+    let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
+    match chain_entries(&ders, utc)
+        .and_then(|entries| Ok((entries, check_chain(&ders, jiff::Timestamp::now())?)))
+    {
+        Ok((entries, problems)) => CertInfo {
+            chain: Some(entries),
+            chain_check: Some(chain_check_label(&problems)),
+            ..info
+        },
+        // A broken chain is a finding about the server, not a failure of the row.
+        Err(e) => CertInfo {
+            chain: Some(Vec::new()),
+            chain_check: Some(format!("NG: {e}")),
+            ..info
+        },
+    }
 }
 
 /// Keeps file descriptors under a typical ulimit.
@@ -124,7 +150,7 @@ fn main() -> ExitCode {
     let results: Vec<CertInfo> = map_bounded(
         &cli.hosts,
         MAX_PARALLEL,
-        |h| inspect(h, &opts, &config, cli.utc),
+        |h| inspect(h, &opts, &config, cli.utc, cli.chain),
         |h| error_info(h, "internal error"),
     );
 

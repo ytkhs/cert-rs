@@ -1,7 +1,6 @@
 use clap::ValueEnum;
 
 use crate::cert::CertInfo;
-use crate::chain::ChainEntry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Format {
@@ -129,6 +128,7 @@ fn render_md(certs: &[CertInfo]) -> String {
 mod tests {
     use super::*;
     use crate::cert::error_info;
+    use crate::chain::ChainEntry;
 
     fn ok() -> CertInfo {
         CertInfo {
