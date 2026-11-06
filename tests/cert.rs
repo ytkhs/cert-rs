@@ -1,0 +1,56 @@
+mod common;
+
+use cert_rs::cert::{cert_info_from_der, error_info, format_time, format_time_in};
+use common::make_cert;
+
+const OV: &[u64] = &[2, 23, 140, 1, 2, 2];
+
+#[test]
+fn format_time_utc() {
+    let t: jiff::Timestamp = "2026-10-07T19:09:54Z".parse().unwrap();
+    assert_eq!(format_time(t, true), "2026-10-07 19:09:54 +0000 UTC");
+}
+
+#[test]
+fn format_time_local_jst() {
+    let tz = jiff::tz::TimeZone::get("Asia/Tokyo").unwrap();
+    let t: jiff::Timestamp = "2026-10-07T19:09:54Z".parse().unwrap();
+    assert_eq!(format_time_in(t, &tz), "2026-10-08 04:09:54 +0900 JST");
+}
+
+#[test]
+fn fields_from_der() {
+    let (der, _) = make_cert(
+        Some("Acme"),
+        &[OV],
+        false,
+        &["a.example.com", "*.example.com"],
+    );
+    let info = cert_info_from_der(&der, "a.example.com", "192.0.2.1", "443", true).unwrap();
+    assert_eq!(info.domain_name, "a.example.com");
+    assert_eq!(info.ip, "192.0.2.1");
+    assert_eq!(info.port, "443");
+    assert_eq!(info.common_name, "a.example.com");
+    assert_eq!(info.issuer, "a.example.com");
+    assert_eq!(
+        info.sans,
+        Some(vec![
+            "a.example.com".to_string(),
+            "*.example.com".to_string()
+        ])
+    );
+    assert_eq!(info.validation_type, "OV");
+    assert_eq!(info.organization, "Acme");
+    assert_eq!(info.error, "");
+    assert!(info.not_before.ends_with("+0000 UTC"));
+    assert!(info.not_after.ends_with("+0000 UTC"));
+}
+
+#[test]
+fn error_info_shape() {
+    let e = error_info("x.example", "boom");
+    assert_eq!(e.domain_name, "x.example");
+    assert_eq!(e.error, "boom");
+    assert!(e.sans.is_none());
+    assert_eq!(e.port, "");
+}
