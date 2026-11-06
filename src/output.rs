@@ -105,7 +105,11 @@ mod tests {
         }
     }
     fn dv() -> CertInfo {
-        CertInfo { validation_type: "DV".into(), organization: "".into(), ..ok() }
+        CertInfo {
+            validation_type: "DV".into(),
+            organization: "".into(),
+            ..ok()
+        }
     }
     fn err() -> CertInfo {
         error_info("bad.example", "boom")
@@ -113,30 +117,41 @@ mod tests {
 
     #[test]
     fn table() {
-        assert_eq!(render(&[ok(), dv(), err()], Format::Table),
-"DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   OV\nOrganization: Acme\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
+        assert_eq!(
+            render(&[ok(), dv(), err()], Format::Table),
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   OV\nOrganization: Acme\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
 DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
-DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n");
+DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
+        );
     }
 
     #[test]
     fn markdown_escapes_star_only_here() {
-        assert_eq!(render(&[ok(), err()], Format::Md),
-"DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+        assert_eq!(
+            render(&[ok(), err()], Format::Md),
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
 a.example.com | 192.0.2.1 | 443 | Test CA | OV | Acme | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> | \n\
-bad.example |  |  |  |  |  |  |  |  |  | boom\n\n");
+bad.example |  |  |  |  |  |  |  |  |  | boom\n\n"
+        );
     }
 
     #[test]
     fn json() {
-        assert_eq!(render(&[dv(), err()], Format::Json),
-r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":""},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","error":"boom"}]"#);
+        assert_eq!(
+            render(&[dv(), err()], Format::Json),
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":""},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","error":"boom"}]"#
+        );
     }
 
     #[test]
     fn json_escapes_html_and_line_separators() {
-        let c = CertInfo { organization: "A&B <C>\u{2028}\u{2029}".into(), ..ok() };
-        assert!(render(&[c], Format::Json)
-            .contains(r#""organization":"A\u0026B \u003cC\u003e\u2028\u2029""#));
+        let c = CertInfo {
+            organization: "A&B <C>\u{2028}\u{2029}".into(),
+            ..ok()
+        };
+        assert!(
+            render(&[c], Format::Json)
+                .contains(r#""organization":"A\u0026B \u003cC\u003e\u2028\u2029""#)
+        );
     }
 }

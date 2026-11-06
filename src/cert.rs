@@ -47,13 +47,11 @@ pub(crate) fn attribute_string(value: &Any) -> Option<String> {
         // T.61 is close enough to Latin-1 that common TLS libraries decode it as such.
         Tag::TeletexString => Some(value.data.iter().map(|&b| char::from(b)).collect()),
         Tag::BmpString => {
-            if value.data.len() % 2 != 0 {
+            let (pairs, odd) = value.data.as_chunks::<2>();
+            if !odd.is_empty() {
                 return None;
             }
-            let units = value
-                .data
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]));
+            let units = pairs.iter().map(|&p| u16::from_be_bytes(p));
             Some(
                 char::decode_utf16(units)
                     .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
