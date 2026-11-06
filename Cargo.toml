@@ -2,7 +2,10 @@
 name = "cert-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Show TLS certificate details for one or more hosts"
+license = "MIT"
+repository = "https://github.com/ytkhs/cert-rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
