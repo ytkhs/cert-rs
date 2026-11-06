@@ -59,6 +59,35 @@ fn mixed_results_keep_order_and_exit_0() {
     assert!(rows[1].get("error").is_none_or(|e| e.as_str() == Some("")));
 }
 
+fn json_rows(args: &[&str]) -> Vec<serde_json::Value> {
+    let out = cert()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    rows.as_array().unwrap().clone()
+}
+
+#[test]
+fn timeout_zero_and_huge_succeed() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    for timeout in ["0", "18446744073709551615"] {
+        let rows = json_rows(&[
+            "-k",
+            "-f",
+            "json",
+            "-s",
+            timeout,
+            &format!("localhost:{port}"),
+        ]);
+        assert_eq!(rows[0]["commonName"], "localhost", "-s {timeout}");
+    }
+}
+
 #[test]
 fn version() {
     let out = cert()

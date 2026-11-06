@@ -37,7 +37,12 @@ pub fn fetch_with_config(
         .map_err(|e| format!("invalid server name {host:?}: {e}"))?;
     let addrs = resolve_addrs(host, port, opts)?;
     // The deadline starts after resolution: std offers no way to bound getaddrinfo.
-    let deadline = Instant::now() + opts.timeout;
+    // A zero or unrepresentable timeout means no limit.
+    let deadline = if opts.timeout.is_zero() {
+        None
+    } else {
+        Instant::now().checked_add(opts.timeout)
+    };
     fetch_from_addrs(
         &format!("{host}:{port}"),
         server_name,
@@ -66,7 +71,7 @@ fn fetch_from_addrs(
     target: &str,
     server_name: ServerName<'static>,
     addrs: &[SocketAddr],
-    deadline: Instant,
+    deadline: Option<Instant>,
     config: Arc<ClientConfig>,
 ) -> Result<Fetched, String> {
     let mut stream = connect(target, addrs, deadline)?;
@@ -78,10 +83,10 @@ fn fetch_from_addrs(
     // Finished is still buffered, so the server would never see it.
     while conn.is_handshaking() || conn.wants_write() {
         let remaining =
-            remaining(deadline).ok_or_else(|| format!("TLS handshake with {target} timed out"))?;
+            remaining(deadline).map_err(|_| format!("TLS handshake with {target} timed out"))?;
         stream
-            .set_read_timeout(Some(remaining))
-            .and_then(|_| stream.set_write_timeout(Some(remaining)))
+            .set_read_timeout(remaining)
+            .and_then(|_| stream.set_write_timeout(remaining))
             .map_err(|e| format!("failed to set socket timeout: {e}"))?;
         let io_err = |e: std::io::Error| match e.kind() {
             ErrorKind::WouldBlock | ErrorKind::TimedOut => {
@@ -120,25 +125,49 @@ fn fetch_from_addrs(
     Ok(Fetched { chain, ip })
 }
 
-fn remaining(deadline: Instant) -> Option<Duration> {
+struct Expired;
+
+/// `Ok(None)` means there is no deadline.
+fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, Expired> {
+    let Some(deadline) = deadline else {
+        return Ok(None);
+    };
     let left = deadline.saturating_duration_since(Instant::now());
-    (!left.is_zero()).then_some(left)
+    if left.is_zero() {
+        Err(Expired)
+    } else {
+        Ok(Some(left))
+    }
 }
 
 /// Splits the remaining time evenly over the untried addresses.
-fn connect(target: &str, addrs: &[SocketAddr], deadline: Instant) -> Result<TcpStream, String> {
-    let mut last_err = format!("no addresses found for {target}");
+fn connect(
+    target: &str,
+    addrs: &[SocketAddr],
+    deadline: Option<Instant>,
+) -> Result<TcpStream, String> {
+    let mut last_err = None;
     for (i, addr) in addrs.iter().enumerate() {
-        let Some(left) = remaining(deadline) else {
-            return Err(format!("connecting to {target} timed out ({last_err})"));
+        let attempt = match remaining(deadline) {
+            Ok(Some(left)) => {
+                // connect_timeout rejects a zero duration.
+                let per_attempt = (left / (addrs.len() - i) as u32).max(Duration::from_nanos(1));
+                TcpStream::connect_timeout(addr, per_attempt)
+            }
+            Ok(None) => TcpStream::connect(addr),
+            Err(Expired) => {
+                return Err(match last_err {
+                    Some(e) => format!("connecting to {target} timed out ({e})"),
+                    None => format!("connecting to {target} timed out"),
+                });
+            }
         };
-        let per_attempt = left / (addrs.len() - i) as u32;
-        match TcpStream::connect_timeout(addr, per_attempt) {
+        match attempt {
             Ok(stream) => return Ok(stream),
-            Err(e) => last_err = format!("failed to connect to {addr}: {e}"),
+            Err(e) => last_err = Some(format!("failed to connect to {addr}: {e}")),
         }
     }
-    Err(last_err)
+    Err(last_err.unwrap_or_else(|| format!("no addresses found for {target}")))
 }
 
 pub fn client_config(skip_verify: bool) -> Result<Arc<ClientConfig>, String> {
@@ -223,7 +252,7 @@ mod tests {
             "localhost",
             name,
             &[a, b],
-            started + Duration::from_secs(1),
+            Some(started + Duration::from_secs(1)),
             config,
         );
         assert!(result.is_err());
@@ -233,7 +262,7 @@ mod tests {
     #[test]
     fn expired_deadline_fails_without_connecting() {
         let (a, _keep) = silent_listener();
-        let result = connect("localhost", &[a], Instant::now());
-        assert!(result.unwrap_err().contains("timed out"));
+        let err = connect("localhost", &[a], Some(Instant::now())).unwrap_err();
+        assert_eq!(err, "connecting to localhost timed out");
     }
 }

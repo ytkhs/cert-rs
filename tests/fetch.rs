@@ -130,3 +130,21 @@ fn slow_drip_handshake_hits_overall_deadline() {
     assert!(err.contains("timed out"), "{err}");
     assert!(started.elapsed() < Duration::from_millis(1800));
 }
+
+#[test]
+fn zero_timeout_means_no_limit() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key).to_string();
+    let mut options = opts(true);
+    options.timeout = Duration::ZERO;
+    assert!(fetch("127.0.0.1", &port, &options).is_ok());
+}
+
+#[test]
+fn huge_timeout_does_not_overflow() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key).to_string();
+    let mut options = opts(true);
+    options.timeout = Duration::from_secs(u64::MAX);
+    assert!(fetch("127.0.0.1", &port, &options).is_ok());
+}
