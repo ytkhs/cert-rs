@@ -5,10 +5,23 @@
 
 ## インストール
 
-Rust のツールチェーンが必要です。
+Rust のツールチェーン（1.88 以上）が必要です。`cert` は `~/.cargo/bin` にインストールされるので、このディレクトリを PATH に含めてください。
+
+### リポジトリから直接インストール
+
+ソースをクローンせずにインストールできます。
 
 ```
-cargo install --path .
+cargo install --locked \
+  --git https://github.com/ytkhs/cert-rs
+```
+
+更新するときは、同じコマンドに `--force` を付けて実行します。
+
+### クローンしたソースからインストール
+
+```
+cargo install --locked --path .
 ```
 
 ## 使い方
