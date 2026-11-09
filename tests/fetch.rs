@@ -3,10 +3,11 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cert_rs::fetch::{Options, client_config, fetch, fetch_with_config};
+use cert_rs::fetch::{Options, client_config, fetch, fetch_keeping_rejected, fetch_with_config};
 use cert_rs::target::parse_resolve;
 use common::{
     closed_port, make_cert, spawn_silent_listener, spawn_tls_server, spawn_tls_server_reporting,
+    spawn_tls_server_rotating,
 };
 use rustls::pki_types::CertificateDer;
 
@@ -36,8 +37,7 @@ fn untrusted_without_k_is_error() {
     let (der, key) = make_cert(None, &[], false, &["localhost"]);
     let port = spawn_tls_server(der, key).to_string();
     let err = fetch("localhost", &port, &opts(false)).err().unwrap();
-    assert!(err.message.contains("certificate"), "{err}");
-    assert!(err.cert_rejected);
+    assert!(err.contains("certificate"), "{err}");
 }
 
 #[test]
@@ -128,8 +128,7 @@ fn slow_drip_handshake_hits_overall_deadline() {
     options.timeout = Duration::from_secs(1);
     let started = Instant::now();
     let err = fetch("127.0.0.1", &port, &options).err().unwrap();
-    assert!(err.message.contains("timed out"), "{err}");
-    assert!(!err.cert_rejected);
+    assert!(err.contains("timed out"), "{err}");
     assert!(started.elapsed() < Duration::from_millis(1800));
 }
 
@@ -161,6 +160,54 @@ fn hostname_mismatch_without_k_is_error() {
     let err = fetch_with_config("www.example.com", &port, &options, config)
         .err()
         .unwrap();
-    assert!(err.message.contains("certificate"), "{err}");
-    assert!(err.cert_rejected);
+    assert!(err.contains("certificate"), "{err}");
+}
+
+fn verifier_trusting(cert_der: &[u8]) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(CertificateDer::from(cert_der.to_vec())).unwrap();
+    rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .unwrap()
+}
+
+#[test]
+fn rejected_chain_is_kept_with_the_reason() {
+    let (trusted, _) = make_cert(None, &[], false, &["localhost"]);
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der.clone(), key).to_string();
+    let fetched = fetch_keeping_rejected(
+        "localhost",
+        &port,
+        &opts(false),
+        verifier_trusting(&trusted),
+    )
+    .unwrap();
+    assert_eq!(fetched.chain[0].as_ref(), der.as_slice());
+    let rejection = fetched.rejection.unwrap();
+    assert!(rejection.contains("certificate"), "{rejection}");
+}
+
+#[test]
+fn accepted_chain_has_no_rejection() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let verifier = verifier_trusting(&der);
+    let port = spawn_tls_server(der, key).to_string();
+    let fetched = fetch_keeping_rejected("localhost", &port, &opts(false), verifier).unwrap();
+    assert!(fetched.rejection.is_none());
+}
+
+#[test]
+fn rejection_and_chain_come_from_the_same_connection() {
+    let (good, good_key) = make_cert(None, &[], false, &["localhost"]);
+    let (bad, bad_key) = make_cert(None, &[], false, &["localhost"]);
+    let verifier = verifier_trusting(&good);
+    let port = spawn_tls_server_rotating(vec![(bad.clone(), bad_key), (good, good_key)]);
+    let fetched =
+        fetch_keeping_rejected("localhost", &port.to_string(), &opts(false), verifier).unwrap();
+    assert!(fetched.rejection.is_some());
+    assert_eq!(fetched.chain[0].as_ref(), bad.as_slice());
 }

@@ -1,6 +1,6 @@
 mod common;
 
-use cert_rs::chain::{ChainReport, inspect_chain, parse_chain};
+use cert_rs::chain::{ChainReport, TrustAnchors, inspect_chain, parse_chain};
 use common::{issue, make_cert};
 use jiff::Timestamp;
 use rcgen::{CertificateParams, DnType, DnValue, KeyPair};
@@ -13,7 +13,13 @@ fn now() -> Timestamp {
 
 fn report_at(ders: &[Vec<u8>], at: Timestamp) -> ChainReport {
     let refs: Vec<&[u8]> = ders.iter().map(|d| d.as_slice()).collect();
-    inspect_chain(&refs, &parse_chain(&refs), true, at)
+    inspect_chain(
+        &refs,
+        &parse_chain(&refs),
+        &TrustAnchors::default(),
+        true,
+        at,
+    )
 }
 
 fn problems(ders: &[Vec<u8>]) -> Vec<String> {
@@ -116,6 +122,34 @@ fn lone_leaf_from_another_issuer_is_reported() {
     let leaf = issue("www.example.com", false, VALID, Some(&ca));
     assert_eq!(
         problems(&[leaf.der()]),
+        vec!["[0] issuer certificate not sent".to_string()]
+    );
+}
+
+#[test]
+fn lone_leaf_issued_by_a_trusted_root_is_not_reported() {
+    let root = issue("Private Root", true, VALID, None);
+    let leaf = issue("www.example.com", false, VALID, Some(&root));
+    let root_der = root.der();
+    let anchors = TrustAnchors::from_ders([root_der.as_slice()]);
+    let ders = [leaf.der()];
+    let refs: Vec<&[u8]> = ders.iter().map(|d| d.as_slice()).collect();
+    let report = inspect_chain(&refs, &parse_chain(&refs), &anchors, true, now());
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+}
+
+#[test]
+fn lone_leaf_is_reported_when_its_issuer_is_not_a_trusted_root() {
+    let other = issue("Other Root", true, VALID, None);
+    let ca = issue("Example Intermediate", true, VALID, None);
+    let leaf = issue("www.example.com", false, VALID, Some(&ca));
+    let other_der = other.der();
+    let anchors = TrustAnchors::from_ders([other_der.as_slice()]);
+    let ders = [leaf.der()];
+    let refs: Vec<&[u8]> = ders.iter().map(|d| d.as_slice()).collect();
+    let report = inspect_chain(&refs, &parse_chain(&refs), &anchors, true, now());
+    assert_eq!(
+        report.problems,
         vec!["[0] issuer certificate not sent".to_string()]
     );
 }

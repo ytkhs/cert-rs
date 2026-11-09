@@ -4,6 +4,7 @@ use serde::Serialize;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry::asn1_rs::Any;
 use x509_parser::parse_x509_certificate;
+use x509_parser::prelude::FromDer;
 use x509_parser::x509::{AttributeTypeAndValue, RelativeDistinguishedName, X509Name};
 
 use crate::cert::{attribute_string, format_time, to_timestamp};
@@ -32,6 +33,40 @@ impl ChainReport {
         } else {
             format!("NG: {}", self.problems.join("; "))
         }
+    }
+}
+
+/// Subjects of the roots the OS trusts, to tell a leaf issued straight from a
+/// root apart from one whose intermediate was left out.
+#[derive(Clone, Debug, Default)]
+pub struct TrustAnchors {
+    subjects: Vec<Vec<u8>>,
+}
+
+impl TrustAnchors {
+    /// Roots that fail to load are skipped; a missing root only risks a false NG.
+    pub fn load() -> Self {
+        Self::from_ders(
+            rustls_native_certs::load_native_certs()
+                .certs
+                .iter()
+                .map(|c| c.as_ref()),
+        )
+    }
+
+    pub fn from_ders<'a>(ders: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let subjects = ders
+            .into_iter()
+            .filter_map(|der| parse_x509_certificate(der).ok())
+            .map(|(_, cert)| cert.subject().as_raw().to_vec())
+            .collect();
+        TrustAnchors { subjects }
+    }
+
+    fn contains(&self, name: &X509Name) -> bool {
+        self.subjects.iter().any(|raw| {
+            X509Name::from_der(raw).is_ok_and(|(_, subject)| names_match(name, &subject))
+        })
     }
 }
 
@@ -119,6 +154,7 @@ fn names_match(a: &X509Name, b: &X509Name) -> bool {
 pub fn inspect_chain(
     ders: &[&[u8]],
     certs: &[Parsed<'_>],
+    anchors: &TrustAnchors,
     utc: bool,
     now: Timestamp,
 ) -> ChainReport {
@@ -168,11 +204,14 @@ pub fn inspect_chain(
         }
     }
 
-    // A lone certificate that someone else issued means the intermediate was left
-    // out. Longer chains may legitimately stop before the root, so only this case
-    // can be told apart without a trust store.
+    // A lone certificate that someone else issued means the intermediate was
+    // left out, unless a trusted root issued it directly (as private CAs may).
+    // Whether verification passed cannot tell: some platform verifiers fetch
+    // the missing intermediate themselves. Longer chains may legitimately stop
+    // before the root, so they are not judged.
     if let [Ok(leaf)] = certs
         && !names_match(leaf.issuer(), leaf.subject())
+        && !anchors.contains(leaf.issuer())
     {
         problems.push("[0] issuer certificate not sent".to_string());
     }
