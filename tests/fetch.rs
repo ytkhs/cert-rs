@@ -36,7 +36,8 @@ fn untrusted_without_k_is_error() {
     let (der, key) = make_cert(None, &[], false, &["localhost"]);
     let port = spawn_tls_server(der, key).to_string();
     let err = fetch("localhost", &port, &opts(false)).err().unwrap();
-    assert!(err.contains("certificate"), "{err}");
+    assert!(err.message.contains("certificate"), "{err}");
+    assert!(err.cert_rejected);
 }
 
 #[test]
@@ -127,7 +128,8 @@ fn slow_drip_handshake_hits_overall_deadline() {
     options.timeout = Duration::from_secs(1);
     let started = Instant::now();
     let err = fetch("127.0.0.1", &port, &options).err().unwrap();
-    assert!(err.contains("timed out"), "{err}");
+    assert!(err.message.contains("timed out"), "{err}");
+    assert!(!err.cert_rejected);
     assert!(started.elapsed() < Duration::from_millis(1800));
 }
 
@@ -159,5 +161,6 @@ fn hostname_mismatch_without_k_is_error() {
     let err = fetch_with_config("www.example.com", &port, &options, config)
         .err()
         .unwrap();
-    assert!(err.contains("certificate"), "{err}");
+    assert!(err.message.contains("certificate"), "{err}");
+    assert!(err.cert_rejected);
 }

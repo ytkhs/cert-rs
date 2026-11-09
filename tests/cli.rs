@@ -212,6 +212,27 @@ fn chain_flag_adds_chain_to_json() {
 }
 
 #[test]
+fn chain_is_shown_for_rejected_certificates_without_k() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["--chain", "-f", "json", &format!("localhost:{port}")]);
+    let error = rows[0]["error"].as_str().unwrap();
+    assert!(error.contains("certificate"), "{error}");
+    assert_eq!(rows[0]["commonName"], "localhost");
+    assert_eq!(rows[0]["chainCheck"], "OK");
+    assert_eq!(rows[0]["chain"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn rejected_certificates_stay_plain_errors_without_chain_flag() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["-f", "json", &format!("localhost:{port}")]);
+    assert_eq!(rows[0]["commonName"], "");
+    assert!(rows[0].get("chain").is_none());
+}
+
+#[test]
 fn chain_is_absent_without_flag() {
     let (der, key) = make_cert(None, &[], false, &["localhost"]);
     let port = spawn_tls_server(der, key);

@@ -22,7 +22,29 @@ pub struct Fetched {
     pub ip: String,
 }
 
-pub fn fetch(host: &str, port: &str, opts: &Options) -> Result<Fetched, String> {
+#[derive(Debug)]
+pub struct FetchError {
+    pub message: String,
+    /// The verifier rejected the server's certificates; the handshake itself was sound.
+    pub cert_rejected: bool,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(message: String) -> Self {
+        FetchError {
+            message,
+            cert_rejected: false,
+        }
+    }
+}
+
+pub fn fetch(host: &str, port: &str, opts: &Options) -> Result<Fetched, FetchError> {
     let config = client_config(opts.skip_verify)?;
     fetch_with_config(host, port, opts, config)
 }
@@ -32,7 +54,7 @@ pub fn fetch_with_config(
     port: &str,
     opts: &Options,
     config: Arc<ClientConfig>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, FetchError> {
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|e| format!("invalid server name {host:?}: {e}"))?;
     let addrs = resolve_addrs(host, port, opts)?;
@@ -73,7 +95,7 @@ fn fetch_from_addrs(
     addrs: &[SocketAddr],
     deadline: Option<Instant>,
     config: Arc<ClientConfig>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, FetchError> {
     let mut stream = connect(target, addrs, deadline)?;
     let mut conn = ClientConnection::new(config, server_name)
         .map_err(|e| format!("failed to start TLS session: {e}"))?;
@@ -98,16 +120,19 @@ fn fetch_from_addrs(
             conn.write_tls(&mut stream).map_err(io_err)?;
         } else if conn.wants_read() {
             if conn.read_tls(&mut stream).map_err(io_err)? == 0 {
-                return Err(format!(
-                    "TLS handshake with {target} failed: connection closed"
-                ));
+                return Err(
+                    format!("TLS handshake with {target} failed: connection closed").into(),
+                );
             }
             if let Err(e) = conn.process_new_packets() {
                 let _ = conn.write_tls(&mut stream);
-                return Err(format!("TLS handshake with {target} failed: {e}"));
+                return Err(FetchError {
+                    message: format!("TLS handshake with {target} failed: {e}"),
+                    cert_rejected: matches!(e, rustls::Error::InvalidCertificate(_)),
+                });
             }
         } else {
-            return Err(format!("TLS handshake with {target} stalled"));
+            return Err(format!("TLS handshake with {target} stalled").into());
         }
     }
 

@@ -4,12 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use cert_rs::cert::{CertInfo, cert_info_from_der, error_info};
-use cert_rs::chain::{ChainEntry, chain_check_label, chain_entries, check_chain};
+use cert_rs::cert::{CertInfo, cert_info, error_info};
+use cert_rs::chain::{inspect_chain, parse_chain};
 use cert_rs::fetch::{Options, client_config, fetch_with_config};
 use cert_rs::output::{Format, render};
 use cert_rs::target::{Resolve, parse_resolve, split_host_port, unmatched_resolves};
 use clap::{ArgAction, Parser};
+use jiff::Timestamp;
 use rustls::ClientConfig;
 
 /// Show TLS certificate details for one or more hosts.
@@ -42,58 +43,70 @@ struct Cli {
     hosts: Vec<String>,
 }
 
-fn inspect(
-    input: &str,
-    opts: &Options,
-    config: &Result<Arc<ClientConfig>, String>,
+struct Run {
+    opts: Options,
+    config: Result<Arc<ClientConfig>, String>,
+    /// Set only with --chain and without -k, to read a chain the verifier rejected.
+    unverified: Option<Result<Arc<ClientConfig>, String>>,
     utc: bool,
     chain: bool,
-) -> CertInfo {
+    /// One reference time for every row, so a shared intermediate gets the same verdict.
+    now: Timestamp,
+}
+
+fn inspect(input: &str, run: &Run) -> CertInfo {
     let (host, port) = match split_host_port(input) {
         Ok(hp) => hp,
         Err(e) => return error_info(input, e),
     };
-    let config = match config {
+    let config = match &run.config {
         Ok(c) => c.clone(),
         Err(e) => return error_info(&host, e),
     };
-    let fetched = match fetch_with_config(&host, &port, opts, config) {
-        Ok(f) => f,
-        Err(e) => return error_info(&host, e),
+    // A rejected chain is exactly what --chain exists to explain, so read it
+    // again without verification and keep the rejection as the row's error.
+    let (fetched, rejection) = match fetch_with_config(&host, &port, &run.opts, config) {
+        Ok(f) => (f, None),
+        Err(e) => match (&run.unverified, e.cert_rejected) {
+            (Some(Ok(unverified)), true) => {
+                match fetch_with_config(&host, &port, &run.opts, unverified.clone()) {
+                    Ok(f) => (f, Some(e.message)),
+                    Err(_) => return error_info(&host, e),
+                }
+            }
+            _ => return error_info(&host, e),
+        },
     };
-    let Some(leaf) = fetched.chain.first() else {
+    let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
+    if ders.is_empty() {
         return error_info(&host, "no certificate presented");
+    }
+    let certs = if run.chain {
+        parse_chain(&ders)
+    } else {
+        parse_chain(&ders[..1])
     };
-    let info = match cert_info_from_der(leaf, &host, &fetched.ip, &port, utc) {
+    let info = match certs[0]
+        .as_ref()
+        .map_err(String::clone)
+        .and_then(|leaf| cert_info(leaf, &host, &fetched.ip, &port, run.utc))
+    {
         Ok(info) => info,
         Err(e) => return error_info(&host, e),
     };
-    if !chain {
+    let info = CertInfo {
+        error: rejection.unwrap_or_default(),
+        ..info
+    };
+    if !run.chain {
         return info;
     }
-    let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
-    match entries_and_problems(&ders, utc) {
-        Ok((entries, problems)) => CertInfo {
-            chain: Some(entries),
-            chain_check: Some(chain_check_label(&problems)),
-            ..info
-        },
-        // A broken chain is a finding about the server, not a failure of the row.
-        Err(e) => CertInfo {
-            chain: Some(Vec::new()),
-            chain_check: Some(format!("NG: {e}")),
-            ..info
-        },
+    let report = inspect_chain(&ders, &certs, run.utc, run.now);
+    CertInfo {
+        chain_check: Some(report.label()),
+        chain: Some(report.entries),
+        ..info
     }
-}
-
-fn entries_and_problems(
-    ders: &[&[u8]],
-    utc: bool,
-) -> Result<(Vec<ChainEntry>, Vec<String>), String> {
-    let entries = chain_entries(ders, utc)?;
-    let problems = check_chain(ders, jiff::Timestamp::now())?;
-    Ok((entries, problems))
 }
 
 /// Keeps file descriptors under a typical ulimit.
@@ -147,17 +160,23 @@ fn main() -> ExitCode {
         eprintln!("warning: --resolve {r} matched no host");
     }
 
-    let opts = Options {
-        skip_verify: cli.skip_verify,
-        timeout: Duration::from_secs(cli.timeout),
-        resolve: cli.resolve,
+    let run = Run {
+        opts: Options {
+            skip_verify: cli.skip_verify,
+            timeout: Duration::from_secs(cli.timeout),
+            resolve: cli.resolve,
+        },
+        config: client_config(cli.skip_verify),
+        unverified: (cli.chain && !cli.skip_verify).then(|| client_config(true)),
+        utc: cli.utc,
+        chain: cli.chain,
+        now: Timestamp::now(),
     };
-    let config = client_config(cli.skip_verify);
 
     let results: Vec<CertInfo> = map_bounded(
         &cli.hosts,
         MAX_PARALLEL,
-        |h| inspect(h, &opts, &config, cli.utc, cli.chain),
+        |h| inspect(h, &run),
         |h| error_info(h, "internal error"),
     );
 

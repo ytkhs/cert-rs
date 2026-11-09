@@ -1,8 +1,9 @@
 mod common;
 
-use cert_rs::chain::{ChainEntry, chain_check_label, chain_entries, check_chain};
+use cert_rs::chain::{ChainReport, inspect_chain, parse_chain};
 use common::{issue, make_cert};
 use jiff::Timestamp;
+use rcgen::{CertificateParams, DnType, DnValue, KeyPair};
 
 const VALID: ((i32, u8, u8), (i32, u8, u8)) = ((2026, 1, 1), (2027, 1, 1));
 
@@ -10,8 +11,13 @@ fn now() -> Timestamp {
     "2026-06-01T00:00:00Z".parse().unwrap()
 }
 
-fn refs(ders: &[Vec<u8>]) -> Vec<&[u8]> {
-    ders.iter().map(|d| d.as_slice()).collect()
+fn report_at(ders: &[Vec<u8>], at: Timestamp) -> ChainReport {
+    let refs: Vec<&[u8]> = ders.iter().map(|d| d.as_slice()).collect();
+    inspect_chain(&refs, &parse_chain(&refs), true, at)
+}
+
+fn problems(ders: &[Vec<u8>]) -> Vec<String> {
+    report_at(ders, now()).problems
 }
 
 #[test]
@@ -19,10 +25,7 @@ fn valid_two_cert_chain_has_no_problems() {
     let ca = issue("Example CA", true, VALID, None);
     let leaf = issue("www.example.com", false, VALID, Some(&ca));
     let ders = [leaf.der(), ca.der()];
-    assert_eq!(
-        check_chain(&refs(&ders), now()).unwrap(),
-        Vec::<String>::new()
-    );
+    assert_eq!(problems(&ders), Vec::<String>::new());
 }
 
 #[test]
@@ -31,7 +34,7 @@ fn three_cert_chain_including_root_has_no_problems() {
     let inter = issue("Example Intermediate", true, VALID, Some(&root));
     let leaf = issue("www.example.com", false, VALID, Some(&inter));
     let ders = [leaf.der(), inter.der(), root.der()];
-    assert!(check_chain(&refs(&ders), now()).unwrap().is_empty());
+    assert!(problems(&ders).is_empty());
 }
 
 #[test]
@@ -40,7 +43,7 @@ fn issuer_mismatch_is_reported() {
     let (b, _) = make_cert(None, &[], false, &["b.example.com"]);
     let ders = [a, b];
     assert_eq!(
-        check_chain(&refs(&ders), now()).unwrap(),
+        problems(&ders),
         vec!["[0] issuer does not match [1] subject".to_string()]
     );
 }
@@ -56,10 +59,7 @@ fn expired_intermediate_is_reported() {
     );
     let leaf = issue("www.example.com", false, VALID, Some(&inter));
     let ders = [leaf.der(), inter.der(), root.der()];
-    assert_eq!(
-        check_chain(&refs(&ders), now()).unwrap(),
-        vec!["[1] expired".to_string()]
-    );
+    assert_eq!(problems(&ders), vec!["[1] expired".to_string()]);
 }
 
 #[test]
@@ -72,10 +72,7 @@ fn not_yet_valid_leaf_is_reported() {
         Some(&ca),
     );
     let ders = [leaf.der(), ca.der()];
-    assert_eq!(
-        check_chain(&refs(&ders), now()).unwrap(),
-        vec!["[0] not yet valid".to_string()]
-    );
+    assert_eq!(problems(&ders), vec!["[0] not yet valid".to_string()]);
 }
 
 #[test]
@@ -83,37 +80,61 @@ fn multiple_problems_are_all_listed() {
     let (a, _) = make_cert(None, &[], false, &["a.example.com"]);
     let old = issue("Old", true, ((2020, 1, 1), (2021, 1, 1)), None);
     let ders = [a, old.der()];
-    let problems = check_chain(&refs(&ders), now()).unwrap();
+    let report = report_at(&ders, now());
     assert_eq!(
-        problems,
+        report.problems,
         vec![
             "[0] issuer does not match [1] subject".to_string(),
             "[1] expired".to_string(),
         ]
     );
     assert_eq!(
-        chain_check_label(&problems),
+        report.label(),
         "NG: [0] issuer does not match [1] subject; [1] expired"
     );
 }
 
 #[test]
 fn label_is_ok_when_no_problems() {
-    assert_eq!(chain_check_label(&[]), "OK");
+    let report = ChainReport {
+        entries: Vec::new(),
+        problems: Vec::new(),
+    };
+    assert_eq!(report.label(), "OK");
 }
 
 #[test]
 fn single_cert_chain_skips_link_check() {
     let (a, _) = make_cert(None, &[], false, &["a.example.com"]);
     let ders = [a];
-    assert!(check_chain(&refs(&ders), now()).unwrap().is_empty());
+    assert!(problems(&ders).is_empty());
 }
 
 #[test]
-fn garbage_der_is_an_error() {
-    let ders = [vec![0u8, 1, 2, 3]];
-    assert!(check_chain(&refs(&ders), now()).is_err());
-    assert!(chain_entries(&refs(&ders), true).is_err());
+fn unparsable_certificate_is_reported_with_its_position() {
+    let root = issue("Example Root", true, VALID, None);
+    let leaf = issue("www.example.com", false, VALID, Some(&root));
+    let ders = [leaf.der(), root.der(), vec![0u8, 1, 2, 3]];
+    let report = report_at(&ders, now());
+    assert_eq!(report.problems.len(), 1);
+    assert!(
+        report.problems[0].starts_with("[2] failed to parse certificate: "),
+        "{:?}",
+        report.problems
+    );
+}
+
+#[test]
+fn certificates_around_an_unparsable_one_are_still_listed() {
+    let root = issue("Example Root", true, VALID, None);
+    let leaf = issue("www.example.com", false, VALID, Some(&root));
+    let ders = [leaf.der(), vec![0u8, 1, 2, 3], root.der()];
+    let report = report_at(&ders, now());
+    assert_eq!(report.entries.len(), 3);
+    assert_eq!(report.entries[0].subject, "CN=www.example.com");
+    assert_eq!(report.entries[1].subject, "");
+    assert_eq!(report.entries[1].sha256.len(), 32 * 3 - 1);
+    assert_eq!(report.entries[2].subject, "CN=Example Root");
 }
 
 #[test]
@@ -121,7 +142,7 @@ fn entries_keep_server_order_and_format_fields() {
     let ca = issue("Example CA", true, VALID, None);
     let leaf = issue("www.example.com", false, VALID, Some(&ca));
     let ders = [leaf.der(), ca.der()];
-    let entries = chain_entries(&refs(&ders), true).unwrap();
+    let entries = report_at(&ders, now()).entries;
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].subject, "CN=www.example.com");
     assert_eq!(entries[0].issuer, "CN=Example CA");
@@ -218,26 +239,9 @@ fn sha256_is_uppercase_colon_separated() {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(":");
-    let entries = chain_entries(&[a.as_slice()], true).unwrap();
+    let entries = report_at(&[a], now()).entries;
     assert_eq!(entries[0].sha256, expected);
     assert_eq!(entries[0].sha256.len(), 32 * 3 - 1);
-}
-
-#[test]
-fn serial_is_uppercase_hex_without_separators() {
-    let (a, _) = make_cert(None, &[], false, &["a.example.com"]);
-    let (_, parsed) = x509_parser::parse_x509_certificate(&a).unwrap();
-    let expected: String = parsed
-        .tbs_certificate
-        .serial
-        .to_bytes_be()
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect();
-    let entries: Vec<ChainEntry> = chain_entries(&[a.as_slice()], true).unwrap();
-    assert_eq!(entries[0].serial, expected);
-    assert!(!entries[0].serial.contains(':'));
-    assert_eq!(entries[0].serial, entries[0].serial.to_uppercase());
 }
 
 #[test]
@@ -246,8 +250,8 @@ fn validity_bounds_are_inclusive() {
     let ders = [cert.der()];
     let not_before: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
     let not_after: Timestamp = "2027-01-01T00:00:00Z".parse().unwrap();
-    assert!(check_chain(&refs(&ders), not_before).unwrap().is_empty());
-    assert!(check_chain(&refs(&ders), not_after).unwrap().is_empty());
+    assert!(report_at(&ders, not_before).problems.is_empty());
+    assert!(report_at(&ders, not_after).problems.is_empty());
 }
 
 #[test]
@@ -256,6 +260,61 @@ fn serial_keeps_leading_nibble_zero_of_known_value() {
     params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x0A, 0x1B, 0x2C]));
     let key = rcgen::KeyPair::generate().unwrap();
     let der = params.self_signed(&key).unwrap().der().to_vec();
-    let entries = chain_entries(&[der.as_slice()], true).unwrap();
+    let entries = report_at(&[der], now()).entries;
     assert_eq!(entries[0].serial, "0A1B2C");
+}
+
+#[test]
+fn serial_with_high_bit_matches_openssl() {
+    let mut params = CertificateParams::new(vec!["a.example.com".to_string()]).unwrap();
+    params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x8A, 0x1B]));
+    let key = KeyPair::generate().unwrap();
+    let der = params.self_signed(&key).unwrap().der().to_vec();
+    assert_eq!(report_at(&[der], now()).entries[0].serial, "8A1B");
+}
+
+fn ca_named(dn: Vec<(DnType, DnValue)>) -> common::Issued {
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    for (ty, value) in dn {
+        params.distinguished_name.push(ty, value);
+    }
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ((y1, m1, d1), (y2, m2, d2)) = VALID;
+    params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+    params.not_after = rcgen::date_time_ymd(y2, m2, d2);
+    let key = KeyPair::generate().unwrap();
+    let cert = params.clone().self_signed(&key).unwrap();
+    common::Issued { params, cert, key }
+}
+
+fn printable(s: &str) -> DnValue {
+    DnValue::PrintableString(s.try_into().unwrap())
+}
+
+#[test]
+fn names_differing_in_string_type_and_case_match() {
+    let signer = ca_named(vec![
+        (
+            DnType::OrganizationName,
+            DnValue::Utf8String("Example Org".into()),
+        ),
+        (DnType::CommonName, DnValue::Utf8String("Example CA".into())),
+    ]);
+    let sent = ca_named(vec![
+        (DnType::OrganizationName, printable("EXAMPLE  org")),
+        (DnType::CommonName, printable("example ca")),
+    ]);
+    let leaf = issue("www.example.com", false, VALID, Some(&signer));
+    assert!(problems(&[leaf.der(), sent.der()]).is_empty());
+}
+
+#[test]
+fn names_differing_in_value_do_not_match() {
+    let signer = ca_named(vec![(DnType::CommonName, printable("Example CA"))]);
+    let sent = ca_named(vec![(DnType::CommonName, printable("Example CA 2"))]);
+    let leaf = issue("www.example.com", false, VALID, Some(&signer));
+    assert_eq!(
+        problems(&[leaf.der(), sent.der()]),
+        vec!["[0] issuer does not match [1] subject".to_string()]
+    );
 }

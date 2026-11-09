@@ -68,20 +68,49 @@ fn render_table(certs: &[CertInfo]) -> String {
     out
 }
 
+/// Chain names come from the server and may hold any text, so every character
+/// with meaning in a markdown table cell or in HTML is neutralized.
+fn escape_md_cell(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' | '|' | '*' | '_' | '`' | '[' | ']' | '~' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '\n' | '\r' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn render_md(certs: &[CertInfo]) -> String {
     let with_chain = certs
         .iter()
         .any(|c| c.chain.is_some() || c.chain_check.is_some());
-    let mut out = String::from(
-        "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error",
-    );
-    let mut rule = String::from("--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---");
+    let mut header = vec![
+        "DomainName",
+        "IP",
+        "Port",
+        "Issuer",
+        "Validation",
+        "Organization",
+        "NotBefore",
+        "NotAfter",
+        "CN",
+        "SANs",
+        "Error",
+    ];
     if with_chain {
-        out.push_str(" | Chain | ChainCheck");
-        rule.push_str(" | --- | ---");
+        header.extend(["Chain", "ChainCheck"]);
     }
+    let mut out = header.join(" | ");
     out.push('\n');
-    out.push_str(&rule);
+    out.push_str(&vec!["---"; header.len()].join(" | "));
     out.push('\n');
     for c in certs {
         let sans: String = c
@@ -90,20 +119,19 @@ fn render_md(certs: &[CertInfo]) -> String {
             .flatten()
             .map(|s| format!("{}<br/>", s.replace('*', "\\*")))
             .collect();
-        out.push_str(&format!(
-            "{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {}\n",
-            c.domain_name,
-            c.ip,
-            c.port,
-            c.issuer,
-            c.validation_type,
-            c.organization,
-            c.not_before,
-            c.not_after,
-            c.common_name,
+        let mut cells = vec![
+            c.domain_name.clone(),
+            c.ip.clone(),
+            c.port.clone(),
+            c.issuer.clone(),
+            c.validation_type.clone(),
+            c.organization.clone(),
+            c.not_before.clone(),
+            c.not_after.clone(),
+            c.common_name.clone(),
             sans,
-            c.error
-        ));
+            c.error.clone(),
+        ];
         if with_chain {
             let chain: String = c
                 .chain
@@ -113,18 +141,17 @@ fn render_md(certs: &[CertInfo]) -> String {
                 .map(|(i, e)| {
                     format!(
                         "[{i}] {} (NotAfter: {})<br/>",
-                        e.subject.replace('*', "\\*"),
+                        escape_md_cell(&e.subject),
                         e.not_after
                     )
                 })
                 .collect();
-            out.pop();
-            out.push_str(&format!(
-                " | {} | {}\n",
-                chain,
-                c.chain_check.as_deref().unwrap_or_default()
-            ));
+            cells.push(chain);
+            // Fixed wording and parser errors only; nothing the server chose.
+            cells.push(c.chain_check.clone().unwrap_or_default());
         }
+        out.push_str(&cells.join(" | "));
+        out.push('\n');
     }
     out.push('\n');
     out
@@ -279,6 +306,28 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
             render(&[c], Format::Md),
             "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
 a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> |  | [0] CN=\\*.example.com (NotAfter: NA)<br/> | OK\n\n"
+        );
+    }
+
+    #[test]
+    fn markdown_neutralizes_table_and_html_syntax_in_chain_subject() {
+        let c = CertInfo {
+            chain: Some(vec![entry(
+                "O=Foo|Bar, OU=<img src=x onerror=alert(1)>, CN=a_b [x](y) `c` \\ ~d & e\nf",
+                "CN=Test CA",
+                "01",
+            )]),
+            chain_check: Some("OK".into()),
+            ..dv()
+        };
+        let md = render(&[c], Format::Md);
+        let row = md.lines().nth(2).unwrap();
+        assert_eq!(row.matches(" | ").count(), 12, "{row}");
+        assert!(
+            row.contains(
+                "[0] O=Foo\\|Bar, OU=&lt;img src=x onerror=alert(1)&gt;, CN=a\\_b \\[x\\](y) \\`c\\` \\\\ \\~d &amp; e f (NotAfter: NA)<br/>"
+            ),
+            "{row}"
         );
     }
 
