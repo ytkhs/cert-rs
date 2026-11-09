@@ -1,6 +1,6 @@
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -20,6 +20,8 @@ pub struct Options {
 pub struct Fetched {
     pub chain: Vec<CertificateDer<'static>>,
     pub ip: String,
+    /// Why the verifier rejected `chain`; only `fetch_keeping_rejected` sets it.
+    pub rejection: Option<String>,
 }
 
 pub fn fetch(host: &str, port: &str, opts: &Options) -> Result<Fetched, String> {
@@ -122,7 +124,11 @@ fn fetch_from_addrs(
         .map_err(|e| format!("failed to get peer address: {e}"))?
         .ip()
         .to_string();
-    Ok(Fetched { chain, ip })
+    Ok(Fetched {
+        chain,
+        ip,
+        rejection: None,
+    })
 }
 
 struct Expired;
@@ -168,6 +174,99 @@ fn connect(
         }
     }
     Err(last_err.unwrap_or_else(|| format!("no addresses found for {target}")))
+}
+
+pub fn platform_verifier() -> Result<Arc<dyn ServerCertVerifier>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    rustls_platform_verifier::Verifier::new(provider)
+        .map(|v| Arc::new(v) as Arc<dyn ServerCertVerifier>)
+        .map_err(|e| format!("failed to load platform verifier: {e}"))
+}
+
+/// Like `fetch_with_config` with `verifier`, except that a rejected chain is
+/// still returned, with the reason in `rejection`. The chain and the reason
+/// come from the same connection, so they always describe the same server.
+pub fn fetch_keeping_rejected(
+    host: &str,
+    port: &str,
+    opts: &Options,
+    verifier: Arc<dyn ServerCertVerifier>,
+) -> Result<Fetched, String> {
+    // One config per connection: the recorded rejection belongs to this handshake only.
+    let keeper = Arc::new(KeepRejected {
+        inner: verifier,
+        rejection: Mutex::new(None),
+    });
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("failed to configure TLS: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(keeper.clone())
+        .with_no_client_auth();
+    let mut fetched = fetch_with_config(host, port, opts, Arc::new(config))?;
+    let rejection = keeper
+        .rejection
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    fetched.rejection = rejection.map(|e| format!("TLS handshake with {host}:{port} failed: {e}"));
+    Ok(fetched)
+}
+
+/// Accepts what `inner` rejects and remembers why. Handshake signatures are
+/// still checked by `inner`, so the peer must hold the certificate's key.
+#[derive(Debug)]
+struct KeepRejected {
+    inner: Arc<dyn ServerCertVerifier>,
+    rejection: Mutex<Option<rustls::Error>>,
+}
+
+impl ServerCertVerifier for KeepRejected {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            Err(e) => {
+                *self.rejection.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                Ok(ServerCertVerified::assertion())
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 pub fn client_config(skip_verify: bool) -> Result<Arc<ClientConfig>, String> {

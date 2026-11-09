@@ -99,10 +99,23 @@ pub fn spawn_tls_server_reporting(
     cert_der: Vec<u8>,
     key: KeyPair,
 ) -> (u16, std::sync::mpsc::Receiver<()>) {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    use std::sync::Arc;
+    serve(vec![server_config(cert_der, key)])
+}
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+/// Presents the certificates in turn, one per connection, as a load balancer
+/// whose backends disagree would.
+pub fn spawn_tls_server_rotating(certs: Vec<(Vec<u8>, KeyPair)>) -> u16 {
+    let configs = certs
+        .into_iter()
+        .map(|(der, key)| server_config(der, key))
+        .collect();
+    serve(configs).0
+}
+
+fn server_config(cert_der: Vec<u8>, key: KeyPair) -> std::sync::Arc<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -110,15 +123,19 @@ pub fn spawn_tls_server_reporting(
         .with_no_client_auth()
         .with_single_cert(vec![CertificateDer::from(cert_der)], key_der)
         .unwrap();
-    let config = Arc::new(config);
+    std::sync::Arc::new(config)
+}
 
+fn serve(
+    configs: Vec<std::sync::Arc<rustls::ServerConfig>>,
+) -> (u16, std::sync::mpsc::Receiver<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        for (n, stream) in listener.incoming().enumerate() {
             let Ok(mut stream) = stream else { continue };
-            let config = config.clone();
+            let config = configs[n % configs.len()].clone();
             let completed_tx = completed_tx.clone();
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));

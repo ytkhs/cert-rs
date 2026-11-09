@@ -1,5 +1,6 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 use x509_parser::oid_registry::asn1_rs::{Any, Tag};
 use x509_parser::parse_x509_certificate;
@@ -75,7 +76,7 @@ fn last_common_name(name: &X509Name) -> String {
         .unwrap_or_default()
 }
 
-fn to_timestamp(t: x509_parser::time::ASN1Time) -> Result<Timestamp, String> {
+pub(crate) fn to_timestamp(t: x509_parser::time::ASN1Time) -> Result<Timestamp, String> {
     Timestamp::from_second(t.timestamp()).map_err(|e| e.to_string())
 }
 
@@ -87,7 +88,17 @@ pub fn cert_info_from_der(
     utc: bool,
 ) -> Result<CertInfo, String> {
     let (_, cert) = parse_x509_certificate(der).map_err(|e| e.to_string())?;
-    let vt = validation_type(&cert);
+    cert_info(&cert, domain, ip, port, utc)
+}
+
+pub fn cert_info(
+    cert: &X509Certificate,
+    domain: &str,
+    ip: &str,
+    port: &str,
+    utc: bool,
+) -> Result<CertInfo, String> {
+    let vt = validation_type(cert);
 
     let dns_names: Vec<String> = match cert.subject_alternative_name() {
         Ok(Some(ext)) => ext
@@ -108,7 +119,7 @@ pub fn cert_info_from_der(
         port: port.to_string(),
         issuer: last_common_name(cert.issuer()),
         validation_type: vt.to_string(),
-        organization: organization(&cert, vt),
+        organization: organization(cert, vt),
         common_name: last_common_name(cert.subject()),
         sans: if dns_names.is_empty() {
             None
