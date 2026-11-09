@@ -111,6 +111,22 @@ fn single_cert_chain_skips_link_check() {
 }
 
 #[test]
+fn lone_leaf_from_another_issuer_is_reported() {
+    let ca = issue("Example CA", true, VALID, None);
+    let leaf = issue("www.example.com", false, VALID, Some(&ca));
+    assert_eq!(
+        problems(&[leaf.der()]),
+        vec!["[0] issuer certificate not sent".to_string()]
+    );
+}
+
+#[test]
+fn lone_self_signed_certificate_is_not_reported() {
+    let cert = issue("www.example.com", false, VALID, None);
+    assert!(problems(&[cert.der()]).is_empty());
+}
+
+#[test]
 fn unparsable_certificate_is_reported_with_its_position() {
     let root = issue("Example Root", true, VALID, None);
     let leaf = issue("www.example.com", false, VALID, Some(&root));

@@ -168,6 +168,15 @@ pub fn inspect_chain(
         }
     }
 
+    // A lone certificate that someone else issued means the intermediate was left
+    // out. Longer chains may legitimately stop before the root, so only this case
+    // can be told apart without a trust store.
+    if let [Ok(leaf)] = certs
+        && !names_match(leaf.issuer(), leaf.subject())
+    {
+        problems.push("[0] issuer certificate not sent".to_string());
+    }
+
     let now = now.as_second();
     for (i, cert) in certs.iter().enumerate() {
         let Ok(cert) = cert else { continue };
