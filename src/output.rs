@@ -68,8 +68,8 @@ fn render_table(certs: &[CertInfo]) -> String {
     out
 }
 
-/// Chain names come from the server and may hold any text, so every character
-/// with meaning in a markdown table cell or in HTML is neutralized.
+/// Names and error text come from the server and may hold any text, so every
+/// character with meaning in a markdown table cell or in HTML is neutralized.
 fn escape_md_cell(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -117,21 +117,24 @@ fn render_md(certs: &[CertInfo]) -> String {
             .sans
             .iter()
             .flatten()
-            .map(|s| format!("{}<br/>", s.replace('*', "\\*")))
+            .map(|s| format!("{}<br/>", escape_md_cell(s)))
             .collect();
-        let mut cells = vec![
-            c.domain_name.clone(),
-            c.ip.clone(),
-            c.port.clone(),
-            c.issuer.clone(),
-            c.validation_type.clone(),
-            c.organization.clone(),
-            c.not_before.clone(),
-            c.not_after.clone(),
-            c.common_name.clone(),
-            sans,
-            c.error.clone(),
-        ];
+        let mut cells: Vec<String> = [
+            &c.domain_name,
+            &c.ip,
+            &c.port,
+            &c.issuer,
+            &c.validation_type,
+            &c.organization,
+            &c.not_before,
+            &c.not_after,
+            &c.common_name,
+        ]
+        .into_iter()
+        .map(|s| escape_md_cell(s))
+        .collect();
+        cells.push(sans);
+        cells.push(escape_md_cell(&c.error));
         if with_chain {
             let chain: String = c
                 .chain
@@ -332,7 +335,25 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
     }
 
     #[test]
-    fn markdown_escapes_star_only_here() {
+    fn markdown_neutralizes_table_and_html_syntax_in_every_column() {
+        let c = CertInfo {
+            issuer: "A|B".into(),
+            organization: "<b>Acme</b>".into(),
+            common_name: "x_y".into(),
+            sans: Some(vec!["a|b.example".into()]),
+            error: "boom | <script>".into(),
+            ..ok()
+        };
+        let md = render(&[c], Format::Md);
+        let row = md.lines().nth(2).unwrap();
+        assert_eq!(
+            row,
+            "a.example.com | 192.0.2.1 | 443 | A\\|B | OV | &lt;b&gt;Acme&lt;/b&gt; | NB | NA | x\\_y | a\\|b.example<br/> | boom \\| &lt;script&gt;"
+        );
+    }
+
+    #[test]
+    fn markdown_escapes_star_in_sans() {
         assert_eq!(
             render(&[ok(), err()], Format::Md),
             "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\

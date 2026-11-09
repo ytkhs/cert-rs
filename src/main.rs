@@ -2,7 +2,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cert_rs::cert::{CertInfo, cert_info, error_info};
 use cert_rs::chain::{inspect_chain, parse_chain};
@@ -63,19 +63,30 @@ fn inspect(input: &str, run: &Run) -> CertInfo {
         Ok(c) => c.clone(),
         Err(e) => return error_info(&host, e),
     };
+    let started = Instant::now();
     // A rejected chain is exactly what --chain exists to explain, so read it
     // again without verification and keep the rejection as the row's error.
     let (fetched, rejection) = match fetch_with_config(&host, &port, &run.opts, config) {
         Ok(f) => (f, None),
-        Err(e) => match (&run.unverified, e.cert_rejected) {
-            (Some(Ok(unverified)), true) => {
-                match fetch_with_config(&host, &port, &run.opts, unverified.clone()) {
-                    Ok(f) => (f, Some(e.message)),
-                    Err(_) => return error_info(&host, e),
+        Err(e) => {
+            let retry = match (&run.unverified, e.cert_rejected) {
+                (Some(Ok(unverified)), true) => {
+                    remaining_timeout(run.opts.timeout, started.elapsed()).map(|timeout| {
+                        let opts = Options {
+                            skip_verify: true,
+                            timeout,
+                            resolve: run.opts.resolve.clone(),
+                        };
+                        fetch_with_config(&host, &port, &opts, unverified.clone())
+                    })
                 }
+                _ => None,
+            };
+            match retry {
+                Some(Ok(f)) => (f, Some(e.message)),
+                _ => return error_info(&host, e),
             }
-            _ => return error_info(&host, e),
-        },
+        }
     };
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
     if ders.is_empty() {
@@ -107,6 +118,15 @@ fn inspect(input: &str, run: &Run) -> CertInfo {
         chain: Some(report.entries),
         ..info
     }
+}
+
+/// What is left of `-s` for a second connection, so both together stay within it.
+/// `None` means the time is used up; a zero `total` stays zero, meaning no limit.
+fn remaining_timeout(total: Duration, elapsed: Duration) -> Option<Duration> {
+    if total.is_zero() {
+        return Some(Duration::ZERO);
+    }
+    total.checked_sub(elapsed).filter(|left| !left.is_zero())
 }
 
 /// Keeps file descriptors under a typical ulimit.
@@ -188,6 +208,27 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn retry_gets_what_is_left_of_the_timeout() {
+        let s = Duration::from_secs;
+        assert_eq!(remaining_timeout(s(3), s(1)), Some(s(2)));
+    }
+
+    #[test]
+    fn retry_is_skipped_once_the_timeout_is_used_up() {
+        let s = Duration::from_secs;
+        assert_eq!(remaining_timeout(s(3), s(3)), None);
+        assert_eq!(remaining_timeout(s(3), s(4)), None);
+    }
+
+    #[test]
+    fn no_limit_stays_no_limit_for_the_retry() {
+        assert_eq!(
+            remaining_timeout(Duration::ZERO, Duration::from_secs(9)),
+            Some(Duration::ZERO)
+        );
+    }
 
     #[test]
     fn keeps_input_order() {

@@ -291,6 +291,8 @@ fn serial_with_high_bit_matches_openssl() {
 
 fn ca_named(dn: Vec<(DnType, DnValue)>) -> common::Issued {
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    // rcgen starts with a default CN, which would pin every name to CN-first.
+    params.distinguished_name = rcgen::DistinguishedName::new();
     for (ty, value) in dn {
         params.distinguished_name.push(ty, value);
     }
@@ -328,6 +330,23 @@ fn names_differing_in_string_type_and_case_match() {
 fn names_differing_in_value_do_not_match() {
     let signer = ca_named(vec![(DnType::CommonName, printable("Example CA"))]);
     let sent = ca_named(vec![(DnType::CommonName, printable("Example CA 2"))]);
+    let leaf = issue("www.example.com", false, VALID, Some(&signer));
+    assert_eq!(
+        problems(&[leaf.der(), sent.der()]),
+        vec!["[0] issuer does not match [1] subject".to_string()]
+    );
+}
+
+#[test]
+fn names_with_attributes_in_different_order_do_not_match() {
+    let signer = ca_named(vec![
+        (DnType::OrganizationName, printable("Example Org")),
+        (DnType::CommonName, printable("Example CA")),
+    ]);
+    let sent = ca_named(vec![
+        (DnType::CommonName, printable("Example CA")),
+        (DnType::OrganizationName, printable("Example Org")),
+    ]);
     let leaf = issue("www.example.com", false, VALID, Some(&signer));
     assert_eq!(
         problems(&[leaf.der(), sent.der()]),
