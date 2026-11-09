@@ -79,30 +79,49 @@ fn inspect(input: &str, run: &Run) -> CertInfo {
         Err(e) => return error_info(&host, e),
     };
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
+    build_row(&host, &port, &fetched.ip, &ders, fetched.rejection, run)
+}
+
+fn build_row(
+    host: &str,
+    port: &str,
+    ip: &str,
+    ders: &[&[u8]],
+    rejection: Option<String>,
+    run: &Run,
+) -> CertInfo {
     if ders.is_empty() {
-        return error_info(&host, "no certificate presented");
+        return error_info(host, "no certificate presented");
     }
     let certs = if run.chain {
-        parse_chain(&ders)
+        parse_chain(ders)
     } else {
         parse_chain(&ders[..1])
     };
-    let info = match certs[0]
+    let leaf = certs[0]
         .as_ref()
         .map_err(String::clone)
-        .and_then(|leaf| cert_info(leaf, &host, &fetched.ip, &port, run.utc))
-    {
+        .and_then(|leaf| cert_info(leaf, host, ip, port, run.utc));
+    let error = [rejection, leaf.as_ref().err().cloned()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let info = match leaf {
         Ok(info) => info,
-        Err(e) => return error_info(&host, e),
+        // The rest of the chain is still worth showing when only the leaf is unreadable.
+        Err(_) if run.chain => CertInfo {
+            ip: ip.to_string(),
+            port: port.to_string(),
+            ..error_info(host, "")
+        },
+        Err(e) => return error_info(host, e),
     };
-    let info = CertInfo {
-        error: fetched.rejection.unwrap_or_default(),
-        ..info
-    };
+    let info = CertInfo { error, ..info };
     if !run.chain {
         return info;
     }
-    let report = inspect_chain(&ders, &certs, &run.anchors, run.utc, run.now);
+    let report = inspect_chain(ders, &certs, &run.anchors, run.utc, run.now);
     CertInfo {
         chain_check: Some(report.label()),
         chain: Some(report.entries),
@@ -194,6 +213,68 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn chain_run() -> Run {
+        Run {
+            opts: Options {
+                skip_verify: false,
+                timeout: Duration::from_secs(1),
+                resolve: Vec::new(),
+            },
+            config: Err("unused".into()),
+            keep_rejected: None,
+            anchors: TrustAnchors::default(),
+            utc: true,
+            chain: true,
+            now: "2026-06-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    fn self_signed(cn: &str) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    #[test]
+    fn unreadable_leaf_keeps_the_rest_of_the_chain() {
+        let good = self_signed("Example CA");
+        let ders: [&[u8]; 2] = [&[0, 1, 2, 3], &good];
+        let row = build_row(
+            "a.example.com",
+            "443",
+            "192.0.2.1",
+            &ders,
+            Some("rejected".into()),
+            &chain_run(),
+        );
+        assert!(row.error.starts_with("rejected; "), "{}", row.error);
+        assert_eq!(row.ip, "192.0.2.1");
+        assert_eq!(row.common_name, "");
+        let chain = row.chain.unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].subject, "CN=rcgen self signed cert");
+        let check = row.chain_check.unwrap();
+        assert!(
+            check.starts_with("NG: [0] failed to parse certificate: "),
+            "{check}"
+        );
+    }
+
+    #[test]
+    fn unreadable_leaf_is_a_plain_error_without_chain_flag() {
+        let run = Run {
+            chain: false,
+            ..chain_run()
+        };
+        let ders: [&[u8]; 1] = [&[0, 1, 2, 3]];
+        let row = build_row("a.example.com", "443", "192.0.2.1", &ders, None, &run);
+        assert_eq!(row.ip, "");
+        assert!(row.chain.is_none());
+        assert!(!row.error.is_empty());
+    }
 
     #[test]
     fn keeps_input_order() {
