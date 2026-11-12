@@ -23,7 +23,7 @@ fn report_at(ders: &[Vec<u8>], at: Timestamp) -> ChainReport {
 }
 
 fn problems(ders: &[Vec<u8>]) -> Vec<String> {
-    report_at(ders, now()).problems
+    report_at(ders, now()).messages()
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn multiple_problems_are_all_listed() {
     let ders = [a, old.der()];
     let report = report_at(&ders, now());
     assert_eq!(
-        report.problems,
+        report.messages(),
         vec![
             "[0] issuer does not match [1] subject".to_string(),
             "[1] expired".to_string(),
@@ -149,7 +149,7 @@ fn lone_leaf_is_reported_when_its_issuer_is_not_a_trusted_root() {
     let refs: Vec<&[u8]> = ders.iter().map(|d| d.as_slice()).collect();
     let report = inspect_chain(&refs, &parse_chain(&refs), &anchors, true, now());
     assert_eq!(
-        report.problems,
+        report.messages(),
         vec!["[0] issuer certificate not sent".to_string()]
     );
 }
@@ -168,7 +168,9 @@ fn unparsable_certificate_is_reported_with_its_position() {
     let report = report_at(&ders, now());
     assert_eq!(report.problems.len(), 1);
     assert!(
-        report.problems[0].starts_with("[2] failed to parse certificate: "),
+        report.problems[0]
+            .message
+            .starts_with("[2] failed to parse certificate: "),
         "{:?}",
         report.problems
     );

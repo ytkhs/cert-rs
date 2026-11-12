@@ -16,22 +16,48 @@ pub struct ChainEntry {
     pub issuer: String,
     pub not_before: String,
     pub not_after: String,
+    pub not_before_utc: Option<String>,
+    pub not_after_utc: Option<String>,
     pub serial: String,
     pub sha256: String,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainProblemKind {
+    IssuerMismatch,
+    Expired,
+    NotYetValid,
+    IssuerNotSent,
+    ParseError,
+    InvalidTime,
+}
+
+/// `index` is the position in the chain; for `IssuerMismatch` it is the
+/// certificate whose issuer does not match the next one's subject.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChainProblem {
+    pub index: usize,
+    pub kind: ChainProblemKind,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChainReport {
     pub entries: Vec<ChainEntry>,
-    pub problems: Vec<String>,
+    pub problems: Vec<ChainProblem>,
 }
 
 impl ChainReport {
+    pub fn messages(&self) -> Vec<String> {
+        self.problems.iter().map(|p| p.message.clone()).collect()
+    }
+
     pub fn label(&self) -> String {
         if self.problems.is_empty() {
             "OK".to_string()
         } else {
-            format!("NG: {}", self.problems.join("; "))
+            format!("NG: {}", self.messages().join("; "))
         }
     }
 }
@@ -150,18 +176,31 @@ pub fn inspect_chain(
     now: Timestamp,
 ) -> ChainReport {
     let mut problems = Vec::new();
+    let mut problem = |index, kind, message: String| {
+        problems.push(ChainProblem {
+            index,
+            kind,
+            message,
+        })
+    };
     let mut entries = Vec::new();
     for (i, (der, cert)) in ders.iter().zip(certs).enumerate() {
         let sha256 = hex_upper(digest(&SHA256, der).as_ref(), ":");
         let cert = match cert {
             Ok(cert) => cert,
             Err(e) => {
-                problems.push(format!("[{i}] failed to parse certificate: {e}"));
+                problem(
+                    i,
+                    ChainProblemKind::ParseError,
+                    format!("[{i}] failed to parse certificate: {e}"),
+                );
                 entries.push(ChainEntry {
                     subject: String::new(),
                     issuer: String::new(),
                     not_before: String::new(),
                     not_after: String::new(),
+                    not_before_utc: None,
+                    not_after_utc: None,
                     serial: String::new(),
                     sha256,
                 });
@@ -170,17 +209,25 @@ pub fn inspect_chain(
         };
         let validity = cert.validity();
         let mut time = |t| match to_timestamp(t) {
-            Ok(t) => format_time(t, utc),
+            Ok(t) => Some(t),
             Err(e) => {
-                problems.push(format!("[{i}] invalid certificate time: {e}"));
-                String::new()
+                problem(
+                    i,
+                    ChainProblemKind::InvalidTime,
+                    format!("[{i}] invalid certificate time: {e}"),
+                );
+                None
             }
         };
+        let (not_before, not_after) = (time(validity.not_before), time(validity.not_after));
+        let shown = |t: Option<Timestamp>| t.map(|t| format_time(t, utc)).unwrap_or_default();
         entries.push(ChainEntry {
             subject: cert.subject().to_string(),
             issuer: cert.issuer().to_string(),
-            not_before: time(validity.not_before),
-            not_after: time(validity.not_after),
+            not_before: shown(not_before),
+            not_after: shown(not_after),
+            not_before_utc: not_before.map(|t| t.to_string()),
+            not_after_utc: not_after.map(|t| t.to_string()),
             serial: serial_hex(cert.raw_serial()),
             sha256,
         });
@@ -191,7 +238,11 @@ pub fn inspect_chain(
         if let [Ok(child), Ok(parent)] = pair
             && !names_match(child.issuer(), parent.subject())
         {
-            problems.push(format!("[{i}] issuer does not match [{}] subject", i + 1));
+            problem(
+                i,
+                ChainProblemKind::IssuerMismatch,
+                format!("[{i}] issuer does not match [{}] subject", i + 1),
+            );
         }
     }
 
@@ -204,7 +255,11 @@ pub fn inspect_chain(
         && !names_match(leaf.issuer(), leaf.subject())
         && !anchors.contains(leaf.issuer())
     {
-        problems.push("[0] issuer certificate not sent".to_string());
+        problem(
+            0,
+            ChainProblemKind::IssuerNotSent,
+            "[0] issuer certificate not sent".to_string(),
+        );
     }
 
     let now = now.as_second();
@@ -212,9 +267,13 @@ pub fn inspect_chain(
         let Ok(cert) = cert else { continue };
         let validity = cert.validity();
         if now < validity.not_before.timestamp() {
-            problems.push(format!("[{i}] not yet valid"));
+            problem(
+                i,
+                ChainProblemKind::NotYetValid,
+                format!("[{i}] not yet valid"),
+            );
         } else if now > validity.not_after.timestamp() {
-            problems.push(format!("[{i}] expired"));
+            problem(i, ChainProblemKind::Expired, format!("[{i}] expired"));
         }
     }
 

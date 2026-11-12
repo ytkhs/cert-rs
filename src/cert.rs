@@ -6,7 +6,8 @@ use x509_parser::oid_registry::asn1_rs::{Any, Tag};
 use x509_parser::parse_x509_certificate;
 use x509_parser::x509::X509Name;
 
-use crate::chain::ChainEntry;
+use crate::chain::{ChainEntry, ChainProblem};
+use crate::error::ErrorKind;
 use crate::validation::{organization, validation_type};
 
 #[derive(serde::Serialize, Clone, Debug, Default)]
@@ -23,11 +24,19 @@ pub struct CertInfo {
     pub sans: Option<Vec<String>>,
     pub not_before: String,
     pub not_after: String,
+    /// RFC 3339 in UTC, for machines; `not_before` and `not_after` are for people.
+    pub not_before_utc: Option<String>,
+    pub not_after_utc: Option<String>,
+    /// Whole days until NotAfter, rounded down; negative once expired.
+    pub days_left: Option<i64>,
     pub error: String,
+    pub error_kind: Option<ErrorKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain: Option<Vec<ChainEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_check: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_problems: Option<Vec<ChainProblem>>,
 }
 
 pub fn format_time(t: Timestamp, utc: bool) -> String {
@@ -86,9 +95,16 @@ pub fn cert_info_from_der(
     ip: &str,
     port: &str,
     utc: bool,
+    now: Timestamp,
 ) -> Result<CertInfo, String> {
     let (_, cert) = parse_x509_certificate(der).map_err(|e| e.to_string())?;
-    cert_info(&cert, domain, ip, port, utc)
+    cert_info(&cert, domain, ip, port, utc, now)
+}
+
+const SECONDS_PER_DAY: i64 = 86_400;
+
+pub fn days_left(not_after: Timestamp, now: Timestamp) -> i64 {
+    (not_after.as_second() - now.as_second()).div_euclid(SECONDS_PER_DAY)
 }
 
 pub fn cert_info(
@@ -97,8 +113,11 @@ pub fn cert_info(
     ip: &str,
     port: &str,
     utc: bool,
+    now: Timestamp,
 ) -> Result<CertInfo, String> {
     let vt = validation_type(cert);
+    let not_before = to_timestamp(cert.validity().not_before)?;
+    let not_after = to_timestamp(cert.validity().not_after)?;
 
     let dns_names: Vec<String> = match cert.subject_alternative_name() {
         Ok(Some(ext)) => ext
@@ -126,18 +145,24 @@ pub fn cert_info(
         } else {
             Some(dns_names)
         },
-        not_before: format_time(to_timestamp(cert.validity().not_before)?, utc),
-        not_after: format_time(to_timestamp(cert.validity().not_after)?, utc),
+        not_before: format_time(not_before, utc),
+        not_after: format_time(not_after, utc),
+        not_before_utc: Some(not_before.to_string()),
+        not_after_utc: Some(not_after.to_string()),
+        days_left: Some(days_left(not_after, now)),
         error: String::new(),
+        error_kind: None,
         chain: None,
         chain_check: None,
+        chain_problems: None,
     })
 }
 
-pub fn error_info(domain: &str, err: impl std::fmt::Display) -> CertInfo {
+pub fn error_info(domain: &str, kind: ErrorKind, err: impl std::fmt::Display) -> CertInfo {
     CertInfo {
         domain_name: domain.to_string(),
         error: err.to_string(),
+        error_kind: Some(kind),
         ..Default::default()
     }
 }

@@ -164,7 +164,8 @@ fn render_md(certs: &[CertInfo]) -> String {
 mod tests {
     use super::*;
     use crate::cert::error_info;
-    use crate::chain::ChainEntry;
+    use crate::chain::{ChainEntry, ChainProblem, ChainProblemKind};
+    use crate::error::ErrorKind;
 
     fn ok() -> CertInfo {
         CertInfo {
@@ -178,9 +179,14 @@ mod tests {
             sans: Some(vec!["a.example.com".into(), "*.example.com".into()]),
             not_before: "NB".into(),
             not_after: "NA".into(),
+            not_before_utc: Some("2026-01-01T00:00:00Z".into()),
+            not_after_utc: Some("2027-01-01T00:00:00Z".into()),
+            days_left: Some(42),
             error: "".into(),
+            error_kind: None,
             chain: None,
             chain_check: None,
+            chain_problems: None,
         }
     }
     fn dv() -> CertInfo {
@@ -191,7 +197,7 @@ mod tests {
         }
     }
     fn err() -> CertInfo {
-        error_info("bad.example", "boom")
+        error_info("bad.example", ErrorKind::Dns, "boom")
     }
     fn entry(subject: &str, issuer: &str, serial: &str) -> ChainEntry {
         ChainEntry {
@@ -199,6 +205,8 @@ mod tests {
             issuer: issuer.into(),
             not_before: "NB".into(),
             not_after: "NA".into(),
+            not_before_utc: Some("2026-01-01T00:00:00Z".into()),
+            not_after_utc: Some("2027-01-01T00:00:00Z".into()),
             serial: serial.into(),
             sha256: "AA:BB".into(),
         }
@@ -210,6 +218,11 @@ mod tests {
                 entry("CN=Test CA", "CN=Test Root", "01"),
             ]),
             chain_check: Some("NG: [1] expired".into()),
+            chain_problems: Some(vec![ChainProblem {
+                index: 1,
+                kind: ChainProblemKind::Expired,
+                message: "[1] expired".into(),
+            }]),
             ..dv()
         }
     }
@@ -261,7 +274,7 @@ bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
     fn json_with_chain() {
         assert_eq!(
             render(&[chained()], Format::Json),
-            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":"","chain":[{"subject":"CN=a.example.com","issuer":"CN=Test CA","notBefore":"NB","notAfter":"NA","serial":"0A1B","sha256":"AA:BB"},{"subject":"CN=Test CA","issuer":"CN=Test Root","notBefore":"NB","notAfter":"NA","serial":"01","sha256":"AA:BB"}],"chainCheck":"NG: [1] expired"}]"#
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"chain":[{"subject":"CN=a.example.com","issuer":"CN=Test CA","notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","serial":"0A1B","sha256":"AA:BB"},{"subject":"CN=Test CA","issuer":"CN=Test Root","notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","serial":"01","sha256":"AA:BB"}],"chainCheck":"NG: [1] expired","chainProblems":[{"index":1,"kind":"expired","message":"[1] expired"}]}]"#
         );
     }
 
@@ -269,6 +282,11 @@ bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
         CertInfo {
             chain: Some(vec![]),
             chain_check: Some("NG: bad der".into()),
+            chain_problems: Some(vec![ChainProblem {
+                index: 0,
+                kind: ChainProblemKind::ParseError,
+                message: "bad der".into(),
+            }]),
             ..dv()
         }
     }
@@ -294,7 +312,7 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
     fn json_chain_parse_failure() {
         assert_eq!(
             render(&[chain_parse_failed()], Format::Json),
-            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":"","chain":[],"chainCheck":"NG: bad der"}]"#
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"chain":[],"chainCheck":"NG: bad der","chainProblems":[{"index":0,"kind":"parse_error","message":"bad der"}]}]"#
         );
     }
 
@@ -366,7 +384,7 @@ bad.example |  |  |  |  |  |  |  |  |  | boom\n\n"
     fn json() {
         assert_eq!(
             render(&[dv(), err()], Format::Json),
-            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","error":""},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","error":"boom"}]"#
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","notBeforeUtc":null,"notAfterUtc":null,"daysLeft":null,"error":"boom","errorKind":"dns"}]"#
         );
     }
 

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use cert_rs::cert::{CertInfo, cert_info, error_info};
 use cert_rs::chain::{TrustAnchors, inspect_chain, parse_chain};
+use cert_rs::error::{ErrorKind, Failure};
 use cert_rs::fetch::{
     Options, client_config, config_with_verifier, fetch_keeping_rejected, fetch_with_config,
     native_roots, server_verifier,
@@ -41,6 +42,9 @@ struct Cli {
     /// Show the certificates exactly as the server sent them and check their links and validity
     #[arg(long)]
     chain: bool,
+    /// Exit with status 1 if any host has an error or a chain problem (output is unchanged)
+    #[arg(long)]
+    fail: bool,
     /// Print version
     #[arg(short = 'v', long, action = ArgAction::Version)]
     version: Option<bool>,
@@ -66,29 +70,33 @@ struct Run {
 fn inspect(input: &str, run: &Run) -> CertInfo {
     let (host, port) = match split_host_port(input) {
         Ok(hp) => hp,
-        Err(e) => return error_info(input, e),
+        Err(e) => return error_info(input, ErrorKind::InvalidInput, e),
     };
+    let setup_failed = |e: &String| Failure::new(ErrorKind::Internal, e.clone());
     let fetched = match &run.keep_rejected {
         Some(verifier) => verifier
-            .clone()
-            .and_then(|v| fetch_keeping_rejected(&host, &port, &run.opts, v)),
+            .as_ref()
+            .map_err(setup_failed)
+            .and_then(|v| fetch_keeping_rejected(&host, &port, &run.opts, v.clone())),
         None => run
             .config
-            .clone()
-            .and_then(|c| fetch_with_config(&host, &port, &run.opts, c)),
+            .as_ref()
+            .map_err(setup_failed)
+            .and_then(|c| fetch_with_config(&host, &port, &run.opts, c.clone())),
     };
     let fetched = match fetched {
         Ok(f) => f,
         Err(e) if is_default_http(input, &port) => {
             return error_info(
                 &host,
+                e.kind,
                 format!(
                     "{e}; http:// URLs use port 80, so use https:// or the bare host \
                      name to check the certificate on 443"
                 ),
             );
         }
-        Err(e) => return error_info(&host, e),
+        Err(e) => return error_info(&host, e.kind, e),
     };
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
     build_row(&host, &port, &fetched.ip, &ders, fetched.rejection, run)
@@ -99,11 +107,11 @@ fn build_row(
     port: &str,
     ip: &str,
     ders: &[&[u8]],
-    rejection: Option<String>,
+    rejection: Option<Failure>,
     run: &Run,
 ) -> CertInfo {
     if ders.is_empty() {
-        return error_info(host, "no certificate presented");
+        return error_info(host, ErrorKind::HandshakeFailed, "no certificate presented");
     }
     let certs = if run.chain {
         parse_chain(ders)
@@ -113,10 +121,17 @@ fn build_row(
     let leaf = certs[0]
         .as_ref()
         .map_err(String::clone)
-        .and_then(|leaf| cert_info(leaf, host, ip, port, run.utc));
-    let error = [rejection, leaf.as_ref().err().cloned()]
+        .and_then(|leaf| cert_info(leaf, host, ip, port, run.utc, run.now))
+        .map_err(|e| Failure::new(ErrorKind::ParseError, e));
+    let failures: Vec<Failure> = [rejection, leaf.as_ref().err().cloned()]
         .into_iter()
         .flatten()
+        .collect();
+    // The first failure is the one that decided the row's fate.
+    let error_kind = failures.first().map(|f| f.kind);
+    let error = failures
+        .iter()
+        .map(|f| f.message.as_str())
         .collect::<Vec<_>>()
         .join("; ");
     let info = match leaf {
@@ -125,11 +140,15 @@ fn build_row(
         Err(_) if run.chain => CertInfo {
             ip: ip.to_string(),
             port: port.to_string(),
-            ..error_info(host, "")
+            ..error_info(host, ErrorKind::ParseError, "")
         },
-        Err(e) => return error_info(host, e),
+        Err(e) => return error_info(host, e.kind, e),
     };
-    let info = CertInfo { error, ..info };
+    let info = CertInfo {
+        error,
+        error_kind,
+        ..info
+    };
     if !run.chain {
         return info;
     }
@@ -137,8 +156,14 @@ fn build_row(
     CertInfo {
         chain_check: Some(report.label()),
         chain: Some(report.entries),
+        chain_problems: Some(report.problems),
         ..info
     }
+}
+
+/// A row that `--fail` counts: an error, or a chain check that found problems.
+fn failed(row: &CertInfo) -> bool {
+    row.error_kind.is_some() || row.chain_problems.as_ref().is_some_and(|p| !p.is_empty())
 }
 
 /// Keeps file descriptors under a typical ulimit.
@@ -224,16 +249,21 @@ fn main() -> ExitCode {
         &cli.hosts,
         MAX_PARALLEL,
         |h| inspect(h, &run),
-        |h| error_info(h, "internal error"),
+        |h| error_info(h, ErrorKind::Internal, "internal error"),
     );
 
     print!("{}", render(&results, cli.format));
-    ExitCode::SUCCESS
+    if cli.fail && results.iter().any(failed) {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cert_rs::chain::ChainProblemKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn chain_run() -> Run {
@@ -269,10 +299,14 @@ mod tests {
             "443",
             "192.0.2.1",
             &ders,
-            Some("rejected".into()),
+            Some(Failure::new(ErrorKind::Untrusted, "rejected")),
             &chain_run(),
         );
         assert!(row.error.starts_with("rejected; "), "{}", row.error);
+        assert_eq!(row.error_kind, Some(ErrorKind::Untrusted));
+        let problems = row.chain_problems.as_ref().unwrap();
+        assert_eq!(problems[0].index, 0);
+        assert_eq!(problems[0].kind, ChainProblemKind::ParseError);
         assert_eq!(row.ip, "192.0.2.1");
         assert_eq!(row.common_name, "");
         let chain = row.chain.unwrap();
