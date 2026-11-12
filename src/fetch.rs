@@ -313,11 +313,30 @@ impl std::fmt::Display for IssuerNotSent {
 
 impl std::error::Error for IssuerNotSent {}
 
+/// The sent chain holds an intermediate outside its validity period, typically
+/// an old one left in place after renewal, while the OS found a current one.
+#[derive(Debug)]
+struct SentIntermediateOutOfDate;
+
+impl std::fmt::Display for SentIntermediateOutOfDate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "an intermediate certificate the server sent is expired or not yet valid \
+             (this OS used another one, but clients that rely on the sent chain will fail)",
+        )
+    }
+}
+
+impl std::error::Error for SentIntermediateOutOfDate {}
+
 /// Some OS verifiers (macOS, Windows) fetch intermediates the server left out
 /// and pass, hiding a mistake that breaks clients which do not fetch. webpki
 /// never fetches, so running it on the sent chain alone exposes the gap.
-/// Only its UnknownIssuer counts: on anything else the OS verifier, which
-/// also checks revocation, has the final say.
+/// Only a missing issuer or an out-of-date certificate counts. The leaf
+/// already passed the OS verifier at the same time, so an out-of-date verdict
+/// can only be about a sent intermediate. On anything else the OS verifier,
+/// which also checks revocation, has the final say, so that differences in
+/// how the two read a certificate never turn into errors.
 #[derive(Debug)]
 struct RequireSentChain {
     platform: Arc<dyn ServerCertVerifier>,
@@ -352,6 +371,14 @@ impl ServerCertVerifier for RequireSentChain {
                     OtherError(Arc::new(IssuerNotSent)),
                 )))
             }
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::Expired
+                | CertificateError::ExpiredContext { .. }
+                | CertificateError::NotValidYet
+                | CertificateError::NotValidYetContext { .. },
+            )) => Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                OtherError(Arc::new(SentIntermediateOutOfDate)),
+            ))),
             _ => Ok(verified),
         }
     }

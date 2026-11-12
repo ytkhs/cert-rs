@@ -266,3 +266,42 @@ fn os_rejection_wins_over_the_sent_chain_check() {
         .unwrap();
     assert!(err.contains("does not lead to a trusted root"), "{err}");
 }
+
+/// The intermediate as re-issued at renewal: same name and key as the old
+/// one, only the validity differs.
+fn intermediate(
+    root: &common::Issued,
+    key_der: &[u8],
+    validity: ((i32, u8, u8), (i32, u8, u8)),
+) -> common::Issued {
+    let key = rcgen::KeyPair::try_from(key_der).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Test Intermediate");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ((y1, m1, d1), (y2, m2, d2)) = validity;
+    params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+    params.not_after = rcgen::date_time_ymd(y2, m2, d2);
+    let issuer = rcgen::Issuer::new(root.params.clone(), &root.key);
+    let cert = params.clone().signed_by(&key, &issuer).unwrap();
+    common::Issued { params, cert, key }
+}
+
+#[test]
+fn expired_intermediate_fails_even_when_the_os_used_a_current_one() {
+    let root = common::issue("Test Root", true, VALID, None);
+    let key_der = rcgen::KeyPair::generate().unwrap().serialize_der();
+    let old = intermediate(&root, &key_der, ((2020, 1, 1), (2021, 1, 1)));
+    let current = intermediate(&root, &key_der, VALID);
+    let leaf = common::issue("localhost", false, VALID, Some(&current));
+    let platform = verifier_trusting(&current.der());
+    let verifier = require_sent_chain(platform, &[CertificateDer::from(root.der())]).unwrap();
+    let port = spawn_tls_server_chain(vec![leaf.der(), old.der()], &leaf.key).to_string();
+    let config = config_with_verifier(verifier).unwrap();
+    let err = fetch_with_config("localhost", &port, &opts(false), config)
+        .err()
+        .unwrap();
+    assert!(err.contains("expired or not yet valid"), "{err}");
+}
