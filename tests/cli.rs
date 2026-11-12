@@ -305,3 +305,67 @@ fn failures_still_exit_0_without_fail() {
     let closed = format!("127.0.0.1:{}", closed_port());
     cert().args([closed.as_str()]).assert().success();
 }
+
+#[test]
+fn error_rows_keep_the_port_that_was_tried() {
+    let port = closed_port().to_string();
+    let rows = json_rows(&["-f", "json", &format!("127.0.0.1:{port}")]);
+    assert_eq!(rows[0]["port"], port.as_str());
+}
+
+#[test]
+fn handshake_failures_keep_the_address_that_was_reached() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["-f", "json", &format!("127.0.0.1:{port}")]);
+    assert!(rows[0]["errorKind"].is_string(), "{}", rows[0]);
+    assert_eq!(rows[0]["ip"], "127.0.0.1");
+}
+
+#[test]
+fn timeouts_point_to_the_limit_option() {
+    let port = common::spawn_silent_listener();
+    let rows = json_rows(&["-f", "json", "-s", "1", &format!("127.0.0.1:{port}")]);
+    assert_eq!(rows[0]["errorKind"], "timeout");
+    let error = rows[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("the limit is 1s, raise it with -s"),
+        "{error}"
+    );
+}
+
+#[test]
+fn json_reports_the_negotiated_tls_and_the_key() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["-k", "-f", "json", &format!("localhost:{port}")]);
+    assert_eq!(rows[0]["tlsVersion"], "TLSv1.3");
+    assert!(
+        rows[0]["cipherSuite"]
+            .as_str()
+            .unwrap()
+            .starts_with("TLS13_")
+    );
+    assert_eq!(rows[0]["keyType"], "EC");
+    assert_eq!(rows[0]["curve"], "P-256");
+    assert_eq!(rows[0]["signatureAlgorithm"], "ecdsa-with-SHA256");
+}
+
+#[test]
+fn table_shows_days_left() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let out = cert()
+        .args(["-k", &format!("localhost:{port}")])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let days = out
+        .lines()
+        .find_map(|l| l.strip_prefix("DaysLeft:     "))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(days.parse::<i64>().is_ok(), "{out}");
+}

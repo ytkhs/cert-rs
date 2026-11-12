@@ -26,6 +26,10 @@ pub struct Fetched {
     pub ip: String,
     /// Why the verifier rejected `chain`; only `fetch_keeping_rejected` sets it.
     pub rejection: Option<Failure>,
+    /// As openssl names them: `TLSv1.3`, `TLSv1.2`.
+    pub tls_version: Option<String>,
+    /// The IANA name, such as `TLS13_AES_256_GCM_SHA384`.
+    pub cipher_suite: Option<String>,
 }
 
 pub fn fetch(host: &str, port: &str, opts: &Options) -> Result<Fetched, Failure> {
@@ -94,8 +98,49 @@ fn fetch_from_addrs(
     config: Arc<ClientConfig>,
 ) -> Result<Fetched, Failure> {
     let mut stream = connect(target, addrs, deadline)?;
+    let ip = stream.peer_addr().ok().map(|a| a.ip().to_string());
     let mut conn = ClientConnection::new(config, server_name)
-        .map_err(|e| internal(format!("failed to start TLS session: {e}")))?;
+        .map_err(|e| internal(format!("failed to start TLS session: {e}")).at(ip.clone()))?;
+    handshake(&mut conn, &mut stream, target, deadline).map_err(|f| f.at(ip.clone()))?;
+
+    let chain = conn
+        .peer_certificates()
+        .ok_or_else(|| {
+            Failure::new(
+                ErrorKind::HandshakeFailed,
+                format!("{target} presented no certificates"),
+            )
+            .at(ip.clone())
+        })?
+        .iter()
+        .map(|c| c.clone().into_owned())
+        .collect();
+    let ip = ip.ok_or_else(|| internal(format!("failed to get the peer address of {target}")))?;
+    Ok(Fetched {
+        chain,
+        ip,
+        rejection: None,
+        tls_version: conn.protocol_version().map(tls_version_name),
+        cipher_suite: conn
+            .negotiated_cipher_suite()
+            .map(|s| format!("{:?}", s.suite())),
+    })
+}
+
+fn tls_version_name(v: rustls::ProtocolVersion) -> String {
+    match v {
+        rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3".into(),
+        rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2".into(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn handshake(
+    conn: &mut ClientConnection,
+    stream: &mut TcpStream,
+    target: &str,
+    deadline: Option<Instant>,
+) -> Result<(), Failure> {
     let failed = |message: String| Failure::new(ErrorKind::HandshakeFailed, message);
     // Not complete_io: it keeps reading until the handshake ends, so a peer that
     // trickles bytes would never give control back to check the deadline.
@@ -120,15 +165,15 @@ fn fetch_from_addrs(
             _ => failed(format!("TLS handshake with {target} failed: {e}")),
         };
         if conn.wants_write() {
-            conn.write_tls(&mut stream).map_err(io_err)?;
+            conn.write_tls(stream).map_err(io_err)?;
         } else if conn.wants_read() {
-            if conn.read_tls(&mut stream).map_err(io_err)? == 0 {
+            if conn.read_tls(stream).map_err(io_err)? == 0 {
                 return Err(failed(format!(
                     "TLS handshake with {target} failed: connection closed"
                 )));
             }
             if let Err(e) = conn.process_new_packets() {
-                let _ = conn.write_tls(&mut stream);
+                let _ = conn.write_tls(stream);
                 return Err(Failure::new(
                     kind_of(&e),
                     format!("TLS handshake with {target} failed: {}", describe(&e)),
@@ -138,23 +183,7 @@ fn fetch_from_addrs(
             return Err(failed(format!("TLS handshake with {target} stalled")));
         }
     }
-
-    let chain = conn
-        .peer_certificates()
-        .ok_or_else(|| failed(format!("{target} presented no certificates")))?
-        .iter()
-        .map(|c| c.clone().into_owned())
-        .collect();
-    let ip = stream
-        .peer_addr()
-        .map_err(|e| internal(format!("failed to get peer address: {e}")))?
-        .ip()
-        .to_string();
-    Ok(Fetched {
-        chain,
-        ip,
-        rejection: None,
-    })
+    Ok(())
 }
 
 struct Expired;

@@ -31,6 +31,8 @@ pub enum ErrorKind {
 pub struct Failure {
     pub kind: ErrorKind,
     pub message: String,
+    /// The address that was reached before the failure, if any.
+    pub ip: Option<String>,
 }
 
 impl Failure {
@@ -38,7 +40,12 @@ impl Failure {
         Failure {
             kind,
             message: message.into(),
+            ip: None,
         }
+    }
+
+    pub fn at(self, ip: Option<String>) -> Self {
+        Failure { ip, ..self }
     }
 }
 
