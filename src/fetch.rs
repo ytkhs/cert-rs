@@ -3,11 +3,14 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
-use rustls_platform_verifier::BuilderVerifierExt;
+use rustls::{
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, OtherError,
+    SignatureScheme,
+};
 
 use crate::target::{Resolve, lookup_resolve};
 
@@ -106,7 +109,10 @@ fn fetch_from_addrs(
             }
             if let Err(e) = conn.process_new_packets() {
                 let _ = conn.write_tls(&mut stream);
-                return Err(format!("TLS handshake with {target} failed: {e}"));
+                return Err(format!(
+                    "TLS handshake with {target} failed: {}",
+                    describe(&e)
+                ));
             }
         } else {
             return Err(format!("TLS handshake with {target} stalled"));
@@ -176,11 +182,136 @@ fn connect(
     Err(last_err.unwrap_or_else(|| format!("no addresses found for {target}")))
 }
 
-pub fn platform_verifier() -> Result<Arc<dyn ServerCertVerifier>, String> {
+/// rustls prints a wrapped platform error with Debug, burying the OS's own
+/// message in `Other(OtherError("..."))`; this unwraps it.
+pub fn describe(e: &rustls::Error) -> String {
+    match e {
+        rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(inner))) => {
+            format!("invalid peer certificate: {inner}")
+        }
+        _ => e.to_string(),
+    }
+}
+
+/// The roots the OS trusts. Roots that fail to load are skipped.
+pub fn native_roots() -> Vec<CertificateDer<'static>> {
+    rustls_native_certs::load_native_certs().certs
+}
+
+/// The OS verifier, plus a second check that the server sent every
+/// intermediate. Without `roots` only the OS verifier runs.
+pub fn server_verifier(
+    roots: &[CertificateDer<'static>],
+) -> Result<Arc<dyn ServerCertVerifier>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    rustls_platform_verifier::Verifier::new(provider)
-        .map(|v| Arc::new(v) as Arc<dyn ServerCertVerifier>)
-        .map_err(|e| format!("failed to load platform verifier: {e}"))
+    let platform: Arc<dyn ServerCertVerifier> = Arc::new(
+        rustls_platform_verifier::Verifier::new(provider.clone())
+            .map_err(|e| format!("failed to load platform verifier: {e}"))?,
+    );
+    require_sent_chain(platform, roots)
+}
+
+/// Wraps `platform` with the sent-chain check against `roots`; returns
+/// `platform` unchanged when no root is usable.
+pub fn require_sent_chain(
+    platform: Arc<dyn ServerCertVerifier>,
+    roots: &[CertificateDer<'static>],
+) -> Result<Arc<dyn ServerCertVerifier>, String> {
+    let mut store = rustls::RootCertStore::empty();
+    store.add_parsable_certificates(roots.iter().cloned());
+    if store.is_empty() {
+        return Ok(platform);
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let sent_only = WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
+        .build()
+        .map_err(|e| format!("failed to build certificate verifier: {e}"))?;
+    Ok(Arc::new(RequireSentChain {
+        platform,
+        sent_only,
+    }))
+}
+
+/// The issuer of the last certificate the server sent is neither among the
+/// sent certificates nor a trusted root.
+#[derive(Debug)]
+struct IssuerNotSent;
+
+impl std::fmt::Display for IssuerNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the server did not send an intermediate certificate \
+             (this OS fetched it, but clients that do not fetch will fail)",
+        )
+    }
+}
+
+impl std::error::Error for IssuerNotSent {}
+
+/// Some OS verifiers (macOS, Windows) fetch intermediates the server left out
+/// and pass, hiding a mistake that breaks clients which do not fetch. webpki
+/// never fetches, so running it on the sent chain alone exposes the gap.
+/// Only its UnknownIssuer counts: on anything else the OS verifier, which
+/// also checks revocation, has the final say.
+#[derive(Debug)]
+struct RequireSentChain {
+    platform: Arc<dyn ServerCertVerifier>,
+    sent_only: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for RequireSentChain {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let verified = self.platform.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        match self.sent_only.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+                Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                    OtherError(Arc::new(IssuerNotSent)),
+                )))
+            }
+            _ => Ok(verified),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.platform.supported_verify_schemes()
+    }
 }
 
 /// Like `fetch_with_config` with `verifier`, except that a rejected chain is
@@ -210,7 +341,8 @@ pub fn fetch_keeping_rejected(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    fetched.rejection = rejection.map(|e| format!("TLS handshake with {host}:{port} failed: {e}"));
+    fetched.rejection =
+        rejection.map(|e| format!("TLS handshake with {host}:{port} failed: {}", describe(&e)));
     Ok(fetched)
 }
 
@@ -269,24 +401,30 @@ impl ServerCertVerifier for KeepRejected {
     }
 }
 
+/// `skip_verify` false loads the OS roots on every call; `config_with_verifier`
+/// reuses a verifier built once.
 pub fn client_config(skip_verify: bool) -> Result<Arc<ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("failed to configure TLS: {e}"))?;
-    let config = if skip_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert {
-                algorithms: provider.signature_verification_algorithms,
-            }))
-            .with_no_client_auth()
+    if skip_verify {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(AcceptAnyCert {
+            algorithms: provider.signature_verification_algorithms,
+        });
+        config_with_verifier(verifier)
     } else {
-        builder
-            .with_platform_verifier()
-            .map_err(|e| format!("failed to load platform verifier: {e}"))?
-            .with_no_client_auth()
-    };
+        config_with_verifier(server_verifier(&native_roots())?)
+    }
+}
+
+pub fn config_with_verifier(
+    verifier: Arc<dyn ServerCertVerifier>,
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("failed to configure TLS: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     Ok(Arc::new(config))
 }
 
@@ -356,6 +494,34 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_millis(1800));
+    }
+
+    #[derive(Debug)]
+    struct Message;
+
+    impl std::fmt::Display for Message {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("certificate is expired")
+        }
+    }
+
+    impl std::error::Error for Message {}
+
+    #[test]
+    fn describe_unwraps_platform_errors() {
+        let e = rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(
+            Message,
+        ))));
+        assert_eq!(
+            describe(&e),
+            "invalid peer certificate: certificate is expired"
+        );
+    }
+
+    #[test]
+    fn describe_keeps_other_errors_as_rustls_prints_them() {
+        let e = rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer);
+        assert_eq!(describe(&e), e.to_string());
     }
 
     #[test]

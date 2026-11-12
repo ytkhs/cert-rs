@@ -44,16 +44,7 @@ pub struct TrustAnchors {
 }
 
 impl TrustAnchors {
-    /// Roots that fail to load are skipped; a missing root only risks a false NG.
-    pub fn load() -> Self {
-        Self::from_ders(
-            rustls_native_certs::load_native_certs()
-                .certs
-                .iter()
-                .map(|c| c.as_ref()),
-        )
-    }
-
+    /// A root missing from `ders` only risks a false NG.
     pub fn from_ders<'a>(ders: impl IntoIterator<Item = &'a [u8]>) -> Self {
         let subjects = ders
             .into_iter()

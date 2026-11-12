@@ -112,7 +112,16 @@ pub fn spawn_tls_server_rotating(certs: Vec<(Vec<u8>, KeyPair)>) -> u16 {
     serve(configs).0
 }
 
+/// Sends `chain` (leaf first) as is; `key` belongs to the leaf.
+pub fn spawn_tls_server_chain(chain: Vec<Vec<u8>>, key: &KeyPair) -> u16 {
+    serve(vec![server_config_chain(chain, key)]).0
+}
+
 fn server_config(cert_der: Vec<u8>, key: KeyPair) -> std::sync::Arc<rustls::ServerConfig> {
+    server_config_chain(vec![cert_der], &key)
+}
+
+fn server_config_chain(chain: Vec<Vec<u8>>, key: &KeyPair) -> std::sync::Arc<rustls::ServerConfig> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
@@ -121,7 +130,10 @@ fn server_config(cert_der: Vec<u8>, key: KeyPair) -> std::sync::Arc<rustls::Serv
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![CertificateDer::from(cert_der)], key_der)
+        .with_single_cert(
+            chain.into_iter().map(CertificateDer::from).collect(),
+            key_der,
+        )
         .unwrap();
     std::sync::Arc::new(config)
 }

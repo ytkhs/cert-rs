@@ -7,7 +7,8 @@ use std::time::Duration;
 use cert_rs::cert::{CertInfo, cert_info, error_info};
 use cert_rs::chain::{TrustAnchors, inspect_chain, parse_chain};
 use cert_rs::fetch::{
-    Options, client_config, fetch_keeping_rejected, fetch_with_config, platform_verifier,
+    Options, client_config, config_with_verifier, fetch_keeping_rejected, fetch_with_config,
+    native_roots, server_verifier,
 };
 use cert_rs::output::{Format, render};
 use cert_rs::target::{Resolve, parse_resolve, split_host_port, unmatched_resolves};
@@ -52,7 +53,7 @@ struct Run {
     /// Set only with --chain and without -k: a rejected chain is exactly what
     /// --chain exists to explain, so it is kept instead of failing the row.
     keep_rejected: Option<Result<Arc<dyn ServerCertVerifier>, String>>,
-    /// Loaded only with --chain; reading the OS store is not free.
+    /// Empty without --chain, where it is not consulted.
     anchors: TrustAnchors,
     utc: bool,
     chain: bool,
@@ -180,16 +181,26 @@ fn main() -> ExitCode {
         eprintln!("warning: --resolve {r} matched no host");
     }
 
+    // Read once and shared: loading the OS store takes a noticeable moment.
+    let roots = if cli.skip_verify && !cli.chain {
+        Vec::new()
+    } else {
+        native_roots()
+    };
+    let verifier = (!cli.skip_verify).then(|| server_verifier(&roots));
     let run = Run {
         opts: Options {
             skip_verify: cli.skip_verify,
             timeout: Duration::from_secs(cli.timeout),
             resolve: cli.resolve,
         },
-        config: client_config(cli.skip_verify),
-        keep_rejected: (cli.chain && !cli.skip_verify).then(platform_verifier),
+        config: match &verifier {
+            None => client_config(true),
+            Some(v) => v.clone().and_then(config_with_verifier),
+        },
+        keep_rejected: if cli.chain { verifier } else { None },
         anchors: if cli.chain {
-            TrustAnchors::load()
+            TrustAnchors::from_ders(roots.iter().map(|r| r.as_ref()))
         } else {
             TrustAnchors::default()
         },
