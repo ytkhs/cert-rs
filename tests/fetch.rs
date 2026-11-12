@@ -3,6 +3,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cert_rs::error::ErrorKind;
 use cert_rs::fetch::{
     Options, client_config, config_with_verifier, fetch, fetch_keeping_rejected, fetch_with_config,
     require_sent_chain,
@@ -40,7 +41,8 @@ fn untrusted_without_k_is_error() {
     let (der, key) = make_cert(None, &[], false, &["localhost"]);
     let port = spawn_tls_server(der, key).to_string();
     let err = fetch("localhost", &port, &opts(false)).err().unwrap();
-    assert!(err.contains("certificate"), "{err}");
+    assert!(err.message.contains("certificate"), "{err}");
+    assert_eq!(err.kind, ErrorKind::Untrusted);
 }
 
 #[test]
@@ -131,7 +133,8 @@ fn slow_drip_handshake_hits_overall_deadline() {
     options.timeout = Duration::from_secs(1);
     let started = Instant::now();
     let err = fetch("127.0.0.1", &port, &options).err().unwrap();
-    assert!(err.contains("timed out"), "{err}");
+    assert!(err.message.contains("timed out"), "{err}");
+    assert_eq!(err.kind, ErrorKind::Timeout);
     assert!(started.elapsed() < Duration::from_millis(1800));
 }
 
@@ -163,7 +166,7 @@ fn hostname_mismatch_without_k_is_error() {
     let err = fetch_with_config("www.example.com", &port, &options, config)
         .err()
         .unwrap();
-    assert!(err.contains("certificate"), "{err}");
+    assert!(err.message.contains("certificate"), "{err}");
 }
 
 fn verifier_trusting(cert_der: &[u8]) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
@@ -179,7 +182,7 @@ fn verifier_trusting(cert_der: &[u8]) -> Arc<dyn rustls::client::danger::ServerC
 
 #[test]
 fn rejected_chain_is_kept_with_the_reason() {
-    let (trusted, _) = make_cert(None, &[], false, &["localhost"]);
+    let trusted = common::issue("Other Root", true, VALID, None).der();
     let (der, key) = make_cert(None, &[], false, &["localhost"]);
     let port = spawn_tls_server(der.clone(), key).to_string();
     let fetched = fetch_keeping_rejected(
@@ -191,7 +194,8 @@ fn rejected_chain_is_kept_with_the_reason() {
     .unwrap();
     assert_eq!(fetched.chain[0].as_ref(), der.as_slice());
     let rejection = fetched.rejection.unwrap();
-    assert!(rejection.contains("certificate"), "{rejection}");
+    assert!(rejection.message.contains("certificate"), "{rejection}");
+    assert_eq!(rejection.kind, ErrorKind::Untrusted, "{rejection}");
 }
 
 #[test]
@@ -242,7 +246,11 @@ fn missing_intermediate_fails_even_when_the_os_fetched_it() {
     let err = fetch_with_config("localhost", &port, &opts(false), config)
         .err()
         .unwrap();
-    assert!(err.contains("did not send an intermediate"), "{err}");
+    assert!(
+        err.message.contains("did not send an intermediate"),
+        "{err}"
+    );
+    assert_eq!(err.kind, ErrorKind::MissingIntermediate);
 }
 
 #[test]
@@ -264,7 +272,11 @@ fn os_rejection_wins_over_the_sent_chain_check() {
     let err = fetch_with_config("localhost", &port, &opts(false), config)
         .err()
         .unwrap();
-    assert!(err.contains("does not lead to a trusted root"), "{err}");
+    assert!(
+        err.message.contains("does not lead to a trusted root"),
+        "{err}"
+    );
+    assert_eq!(err.kind, ErrorKind::Untrusted);
 }
 
 /// The intermediate as re-issued at renewal: same name and key as the old
@@ -303,5 +315,6 @@ fn expired_intermediate_fails_even_when_the_os_used_a_current_one() {
     let err = fetch_with_config("localhost", &port, &opts(false), config)
         .err()
         .unwrap();
-    assert!(err.contains("expired or not yet valid"), "{err}");
+    assert!(err.message.contains("expired or not yet valid"), "{err}");
+    assert_eq!(err.kind, ErrorKind::SentIntermediateOutOfDate);
 }

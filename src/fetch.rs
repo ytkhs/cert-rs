@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use rustls::{
     SignatureScheme,
 };
 
+use crate::error::{ErrorKind, Failure};
 use crate::target::{Resolve, lookup_resolve};
 
 pub struct Options {
@@ -24,11 +25,11 @@ pub struct Fetched {
     pub chain: Vec<CertificateDer<'static>>,
     pub ip: String,
     /// Why the verifier rejected `chain`; only `fetch_keeping_rejected` sets it.
-    pub rejection: Option<String>,
+    pub rejection: Option<Failure>,
 }
 
-pub fn fetch(host: &str, port: &str, opts: &Options) -> Result<Fetched, String> {
-    let config = client_config(opts.skip_verify)?;
+pub fn fetch(host: &str, port: &str, opts: &Options) -> Result<Fetched, Failure> {
+    let config = client_config(opts.skip_verify).map_err(internal)?;
     fetch_with_config(host, port, opts, config)
 }
 
@@ -37,9 +38,13 @@ pub fn fetch_with_config(
     port: &str,
     opts: &Options,
     config: Arc<ClientConfig>,
-) -> Result<Fetched, String> {
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| format!("invalid server name {host:?}: {e}"))?;
+) -> Result<Fetched, Failure> {
+    let server_name = ServerName::try_from(host.to_string()).map_err(|e| {
+        Failure::new(
+            ErrorKind::InvalidInput,
+            format!("invalid server name {host:?}: {e}"),
+        )
+    })?;
     let addrs = resolve_addrs(host, port, opts)?;
     // The deadline starts after resolution: std offers no way to bound getaddrinfo.
     // A zero or unrepresentable timeout means no limit.
@@ -57,17 +62,26 @@ pub fn fetch_with_config(
     )
 }
 
-fn resolve_addrs(host: &str, port: &str, opts: &Options) -> Result<Vec<SocketAddr>, String> {
-    let port_num: u16 = port.parse().map_err(|_| format!("invalid port {port:?}"))?;
+fn internal(message: String) -> Failure {
+    Failure::new(ErrorKind::Internal, message)
+}
+
+fn resolve_addrs(host: &str, port: &str, opts: &Options) -> Result<Vec<SocketAddr>, Failure> {
+    let port_num: u16 = port
+        .parse()
+        .map_err(|_| Failure::new(ErrorKind::InvalidInput, format!("invalid port {port:?}")))?;
     if let Some(ip) = lookup_resolve(&opts.resolve, host, port) {
         return Ok(vec![SocketAddr::new(ip, port_num)]);
     }
     let addrs: Vec<SocketAddr> = (host, port_num)
         .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve {host}: {e}"))?
+        .map_err(|e| Failure::new(ErrorKind::Dns, format!("failed to resolve {host}: {e}")))?
         .collect();
     if addrs.is_empty() {
-        return Err(format!("no addresses found for {host}"));
+        return Err(Failure::new(
+            ErrorKind::Dns,
+            format!("no addresses found for {host}"),
+        ));
     }
     Ok(addrs)
 }
@@ -78,56 +92,62 @@ fn fetch_from_addrs(
     addrs: &[SocketAddr],
     deadline: Option<Instant>,
     config: Arc<ClientConfig>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, Failure> {
     let mut stream = connect(target, addrs, deadline)?;
     let mut conn = ClientConnection::new(config, server_name)
-        .map_err(|e| format!("failed to start TLS session: {e}"))?;
+        .map_err(|e| internal(format!("failed to start TLS session: {e}")))?;
+    let failed = |message: String| Failure::new(ErrorKind::HandshakeFailed, message);
     // Not complete_io: it keeps reading until the handshake ends, so a peer that
     // trickles bytes would never give control back to check the deadline.
     // Not is_handshaking() alone: in TLS 1.3 it turns false while the client
     // Finished is still buffered, so the server would never see it.
     while conn.is_handshaking() || conn.wants_write() {
-        let remaining =
-            remaining(deadline).map_err(|_| format!("TLS handshake with {target} timed out"))?;
+        let remaining = remaining(deadline).map_err(|_| {
+            Failure::new(
+                ErrorKind::Timeout,
+                format!("TLS handshake with {target} timed out"),
+            )
+        })?;
         stream
             .set_read_timeout(remaining)
             .and_then(|_| stream.set_write_timeout(remaining))
-            .map_err(|e| format!("failed to set socket timeout: {e}"))?;
+            .map_err(|e| internal(format!("failed to set socket timeout: {e}")))?;
         let io_err = |e: std::io::Error| match e.kind() {
-            ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-                format!("TLS handshake with {target} timed out")
-            }
-            _ => format!("TLS handshake with {target} failed: {e}"),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Failure::new(
+                ErrorKind::Timeout,
+                format!("TLS handshake with {target} timed out"),
+            ),
+            _ => failed(format!("TLS handshake with {target} failed: {e}")),
         };
         if conn.wants_write() {
             conn.write_tls(&mut stream).map_err(io_err)?;
         } else if conn.wants_read() {
             if conn.read_tls(&mut stream).map_err(io_err)? == 0 {
-                return Err(format!(
+                return Err(failed(format!(
                     "TLS handshake with {target} failed: connection closed"
-                ));
+                )));
             }
             if let Err(e) = conn.process_new_packets() {
                 let _ = conn.write_tls(&mut stream);
-                return Err(format!(
-                    "TLS handshake with {target} failed: {}",
-                    describe(&e)
+                return Err(Failure::new(
+                    kind_of(&e),
+                    format!("TLS handshake with {target} failed: {}", describe(&e)),
                 ));
             }
         } else {
-            return Err(format!("TLS handshake with {target} stalled"));
+            return Err(failed(format!("TLS handshake with {target} stalled")));
         }
     }
 
     let chain = conn
         .peer_certificates()
-        .ok_or_else(|| format!("{target} presented no certificates"))?
+        .ok_or_else(|| failed(format!("{target} presented no certificates")))?
         .iter()
         .map(|c| c.clone().into_owned())
         .collect();
     let ip = stream
         .peer_addr()
-        .map_err(|e| format!("failed to get peer address: {e}"))?
+        .map_err(|e| internal(format!("failed to get peer address: {e}")))?
         .ip()
         .to_string();
     Ok(Fetched {
@@ -157,10 +177,11 @@ fn connect(
     target: &str,
     addrs: &[SocketAddr],
     deadline: Option<Instant>,
-) -> Result<TcpStream, String> {
+) -> Result<TcpStream, Failure> {
     // Every failed address is reported: the last one alone can hide the
     // cause, such as IPv6 unreachable while IPv4 is refused.
     let mut failures: Vec<String> = Vec::new();
+    let mut all_timed_out = true;
     for (i, addr) in addrs.iter().enumerate() {
         let attempt = match remaining(deadline) {
             Ok(Some(left)) => {
@@ -170,25 +191,90 @@ fn connect(
             }
             Ok(None) => TcpStream::connect(addr),
             Err(Expired) => {
-                return Err(if failures.is_empty() {
-                    format!("connecting to {target} timed out")
-                } else {
-                    format!("connecting to {target} timed out ({})", failures.join("; "))
-                });
+                return Err(Failure::new(
+                    ErrorKind::Timeout,
+                    if failures.is_empty() {
+                        format!("connecting to {target} timed out")
+                    } else {
+                        format!("connecting to {target} timed out ({})", failures.join("; "))
+                    },
+                ));
             }
         };
         match attempt {
             Ok(stream) => return Ok(stream),
-            Err(e) => failures.push(format!("{addr}: {e}")),
+            Err(e) => {
+                all_timed_out &= e.kind() == io::ErrorKind::TimedOut;
+                failures.push(format!("{addr}: {e}"));
+            }
         }
     }
     if failures.is_empty() {
-        Err(format!("no addresses found for {target}"))
+        return Err(Failure::new(
+            ErrorKind::Dns,
+            format!("no addresses found for {target}"),
+        ));
+    }
+    let kind = if all_timed_out {
+        ErrorKind::Timeout
     } else {
-        Err(format!(
-            "failed to connect to {target} ({})",
-            failures.join("; ")
-        ))
+        ErrorKind::Connect
+    };
+    Err(Failure::new(
+        kind,
+        format!("failed to connect to {target} ({})", failures.join("; ")),
+    ))
+}
+
+/// Classifies a TLS failure from the error itself, never from its wording.
+pub fn kind_of(e: &rustls::Error) -> ErrorKind {
+    use rustls::{AlertDescription, CertificateError as C, Error, PeerIncompatible};
+    match e {
+        Error::InvalidCertificate(c) => match c {
+            C::Other(OtherError(inner)) => {
+                if inner.downcast_ref::<IssuerNotSent>().is_some() {
+                    ErrorKind::MissingIntermediate
+                } else if inner.downcast_ref::<SentIntermediateOutOfDate>().is_some() {
+                    ErrorKind::SentIntermediateOutOfDate
+                } else {
+                    os_status_kind(&inner.to_string())
+                }
+            }
+            C::NotValidForName | C::NotValidForNameContext { .. } => ErrorKind::NameMismatch,
+            C::UnknownIssuer => ErrorKind::Untrusted,
+            C::Revoked => ErrorKind::Revoked,
+            C::Expired | C::ExpiredContext { .. } => ErrorKind::Expired,
+            C::NotValidYet | C::NotValidYetContext { .. } => ErrorKind::NotYetValid,
+            C::UnsupportedSignatureAlgorithmContext { .. }
+            | C::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => {
+                ErrorKind::WeakSignature
+            }
+            _ => ErrorKind::CertificateInvalid,
+        },
+        Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType) => ErrorKind::NotTls,
+        Error::AlertReceived(
+            AlertDescription::HandshakeFailure
+            | AlertDescription::ProtocolVersion
+            | AlertDescription::InsufficientSecurity,
+        )
+        | Error::PeerIncompatible(
+            PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig
+            | PeerIncompatible::NoCipherSuitesInCommon
+            | PeerIncompatible::NoKxGroupsInCommon,
+        ) => ErrorKind::HandshakeRefused,
+        _ => ErrorKind::HandshakeFailed,
+    }
+}
+
+/// macOS reports certificate problems as text ending in an OSStatus code.
+/// Only codes seen from its verifier are mapped; the rest stay generic.
+fn os_status_kind(message: &str) -> ErrorKind {
+    match message.rsplit_once(": ").map(|(_, code)| code) {
+        Some("-67818") => ErrorKind::Expired,
+        Some("-67819") => ErrorKind::NotYetValid,
+        Some("-67843") => ErrorKind::Untrusted,
+        Some("-67815") => ErrorKind::WeakSignature,
+        _ => ErrorKind::CertificateInvalid,
     }
 }
 
@@ -414,7 +500,7 @@ pub fn fetch_keeping_rejected(
     port: &str,
     opts: &Options,
     verifier: Arc<dyn ServerCertVerifier>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, Failure> {
     // One config per connection: the recorded rejection belongs to this handshake only.
     let keeper = Arc::new(KeepRejected {
         inner: verifier,
@@ -423,7 +509,7 @@ pub fn fetch_keeping_rejected(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("failed to configure TLS: {e}"))?
+        .map_err(|e| internal(format!("failed to configure TLS: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(keeper.clone())
         .with_no_client_auth();
@@ -433,8 +519,12 @@ pub fn fetch_keeping_rejected(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    fetched.rejection =
-        rejection.map(|e| format!("TLS handshake with {host}:{port} failed: {}", describe(&e)));
+    fetched.rejection = rejection.map(|e| {
+        Failure::new(
+            kind_of(&e),
+            format!("TLS handshake with {host}:{port} failed: {}", describe(&e)),
+        )
+    });
     Ok(fetched)
 }
 
@@ -668,13 +758,15 @@ mod tests {
         let b = closed(crate_closed_port());
         let err = connect("localhost:1", &[a, b], None).unwrap_err();
         assert!(
-            err.starts_with("failed to connect to localhost:1 ("),
+            err.message
+                .starts_with("failed to connect to localhost:1 ("),
             "{err}"
         );
         assert!(
-            err.contains(&a.to_string()) && err.contains(&b.to_string()),
+            err.message.contains(&a.to_string()) && err.message.contains(&b.to_string()),
             "{err}"
         );
+        assert_eq!(err.kind, ErrorKind::Connect);
     }
 
     fn crate_closed_port() -> u16 {
@@ -689,6 +781,9 @@ mod tests {
     fn expired_deadline_fails_without_connecting() {
         let (a, _keep) = silent_listener();
         let err = connect("localhost", &[a], Some(Instant::now())).unwrap_err();
-        assert_eq!(err, "connecting to localhost timed out");
+        assert_eq!(
+            err,
+            Failure::new(ErrorKind::Timeout, "connecting to localhost timed out")
+        );
     }
 }

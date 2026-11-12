@@ -254,3 +254,54 @@ fn chain_is_not_added_to_error_rows() {
     assert!(rows[0].get("chain").is_none());
     assert!(rows[0].get("chainCheck").is_none());
 }
+
+#[test]
+fn json_rows_carry_error_kind_and_days_left() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let closed = format!("127.0.0.1:{}", closed_port());
+    let rows = json_rows(&["-k", "-f", "json", &format!("localhost:{port}"), &closed]);
+    assert_eq!(rows[0]["errorKind"], serde_json::Value::Null);
+    assert!(rows[0]["daysLeft"].is_i64(), "{}", rows[0]);
+    assert!(rows[0]["notAfterUtc"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(rows[1]["errorKind"], "connect");
+    assert_eq!(rows[1]["daysLeft"], serde_json::Value::Null);
+}
+
+#[test]
+fn chain_problems_are_listed_in_json() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    let rows = json_rows(&["--chain", "-k", "-f", "json", &format!("localhost:{port}")]);
+    assert_eq!(rows[0]["chainProblems"], serde_json::json!([]));
+}
+
+#[test]
+fn fail_exits_1_when_a_host_fails_and_keeps_the_output() {
+    let closed = format!("127.0.0.1:{}", closed_port());
+    let out = cert()
+        .args(["--fail", "-f", "json", &closed])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let rows: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(rows[0]["errorKind"], "connect");
+}
+
+#[test]
+fn fail_exits_0_when_every_host_is_fine() {
+    let (der, key) = make_cert(None, &[], false, &["localhost"]);
+    let port = spawn_tls_server(der, key);
+    cert()
+        .args(["--fail", "-k", &format!("localhost:{port}")])
+        .assert()
+        .success();
+}
+
+#[test]
+fn failures_still_exit_0_without_fail() {
+    let closed = format!("127.0.0.1:{}", closed_port());
+    cert().args([closed.as_str()]).assert().success();
+}
