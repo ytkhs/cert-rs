@@ -46,6 +46,7 @@ cert example.com example.org
 | `-s`, `--timeout <秒>` | 接続と TLS ハンドシェイクを合わせたタイムアウト秒数。DNS の名前解決は含まない。0 は上限なし（既定: 3） |
 | `-r`, `--resolve <HOST:PORT:ADDR>` | 名前解決を上書きして ADDR に接続する（複数指定可。IPv6 は `[2001:db8::1]` のように角括弧で囲む） |
 | `--chain` | サーバーが送ってきた証明書チェーンをそのまま表示し、つながりと有効期間を検査する |
+| `--fail` | エラーかチェーンの問題があるホストが 1 つでもあれば、終了コード 1 で終わる（出力は変わらない） |
 | `-v`, `--version` | バージョンを表示する |
 
 形式を変える:
@@ -141,7 +142,7 @@ ChainCheck:   OK
 
 `-k` を付けなくても使えます。中間証明書の欠落などで検証に失敗した場合も、その接続で受け取ったチェーンを表示し、`Error` には検証に失敗した理由を出します。
 
-NG でも終了コードは 0 のままです。JSON では `chain` と `chainCheck` が各行に加わります。接続できなかった行など、チェーンを読めなかったエラー行にはどちらも付きません。
+NG でも終了コードは 0 のままです。JSON では `chain`・`chainCheck`・`chainProblems` が各行に加わります。接続できなかった行など、チェーンを読めなかったエラー行にはどちらも付きません。
 
 ### JSON と jq
 
@@ -152,8 +153,56 @@ cert -f json example.com example.org | jq '.[] | {domainName, notAfter, error}'
 エラーのあるホストだけを取り出す:
 
 ```
-cert -f json example.com example.org | jq '.[] | select(.error != "")'
+cert -f json example.com example.org | jq '.[] | select(.errorKind != null)'
 ```
+
+30 日以内に期限が切れるホストを取り出す:
+
+```
+cert -f json example.com example.org | jq '.[] | select(.daysLeft != null and .daysLeft < 30)'
+```
+
+スクリプトや CI で失敗を検出する:
+
+```
+cert --fail example.com example.org
+```
+
+#### JSON の欄
+
+スクリプトや AI から読むときは、表示用の `notBefore`・`notAfter`・`error` ではなく、次の欄を使ってください。表示用の欄は文言や書式が変わることがありますが、これらの欄の値は変えません。
+
+| 欄 | 内容 |
+| --- | --- |
+| `notBeforeUtc`, `notAfterUtc` | 有効期間の始まりと終わり。RFC 3339 の UTC（例: `2027-01-01T00:00:00Z`）。エラー行は `null` |
+| `daysLeft` | 期限までの日数（切り捨て）。期限切れなら負の数。エラー行は `null` |
+| `errorKind` | エラーの種類。エラーがなければ `null`。値は下の表のとおり |
+| `chainProblems` | `--chain` のときだけ付く。チェーンの問題の配列で、問題がなければ `[]`。各要素は `index`（何番目の証明書か）、`kind`、`message` |
+| `chain[].notBeforeUtc`, `chain[].notAfterUtc` | チェーンの各証明書の有効期間（RFC 3339 の UTC） |
+
+`errorKind` の値:
+
+| 値 | 意味 |
+| --- | --- |
+| `invalid_input` | ホストの指定が不正 |
+| `dns` | 名前解決に失敗した |
+| `connect` | 接続を拒否された、または到達できない |
+| `timeout` | 接続かハンドシェイクが時間切れになった |
+| `not_tls` | TLS で応答しないポート |
+| `handshake_refused` | サーバーがハンドシェイクを拒否した（TLS 1.1 以前や古い暗号方式のみのサーバー） |
+| `handshake_failed` | そのほかの TLS の失敗 |
+| `expired`, `not_yet_valid` | サーバー証明書が有効期間外 |
+| `name_mismatch` | 証明書がホスト名に合わない |
+| `untrusted` | 信頼できるルートにつながらない |
+| `revoked` | 失効している |
+| `weak_signature` | SHA-1 など危険な署名方式 |
+| `missing_intermediate` | サーバーが中間証明書を送っていない |
+| `sent_intermediate_out_of_date` | サーバーが送った中間証明書が有効期間外 |
+| `certificate_invalid` | そのほかの証明書の問題 |
+| `parse_error` | 証明書を解析できない |
+| `internal` | cert 自身の内部エラー |
+
+`chainProblems[].kind` の値: `issuer_mismatch`（`index` の証明書の発行者が次の証明書と一致しない）、`expired`、`not_yet_valid`、`issuer_not_sent`、`parse_error`、`invalid_time`。
 
 ## 制限事項
 
