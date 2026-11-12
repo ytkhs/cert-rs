@@ -2,6 +2,16 @@ use std::fmt;
 use std::net::IpAddr;
 
 const DEFAULT_PORT: &str = "443";
+const HTTP_PORT: &str = "80";
+
+/// An `http://` URL left to its default port, where TLS is not expected;
+/// a failure there deserves a pointer to 443.
+pub fn is_default_http(input: &str, port: &str) -> bool {
+    input
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
+        && port == HTTP_PORT
+}
 
 /// A name resolution override given as `--resolve HOST:PORT:ADDR`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,8 +33,12 @@ impl fmt::Display for Resolve {
 /// Splits a host argument (`host`, `host:port`, `[v6]:port` or a URL) into `(host, port)`.
 pub fn split_host_port(input: &str) -> Result<(String, String), String> {
     // Not the url crate: pulling in a URL parser just to find the authority is overkill.
+    let mut default_port = DEFAULT_PORT;
     let authority = match input.split_once("://") {
-        Some((_, rest)) => {
+        Some((scheme, rest)) => {
+            if scheme.eq_ignore_ascii_case("http") {
+                default_port = HTTP_PORT;
+            }
             let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
             authority
                 .rsplit_once('@')
@@ -57,7 +71,7 @@ pub fn split_host_port(input: &str) -> Result<(String, String), String> {
         authority.split_once(':').unwrap_or((authority, ""))
     };
 
-    let port = if port.is_empty() { DEFAULT_PORT } else { port };
+    let port = if port.is_empty() { default_port } else { port };
     Ok((host.to_string(), port.to_string()))
 }
 
@@ -140,6 +154,27 @@ mod tests {
             split_host_port("https://example.com/path").unwrap(),
             ("example.com".into(), "443".into())
         );
+    }
+    #[test]
+    fn http_url_defaults_to_80() {
+        assert_eq!(
+            split_host_port("HTTP://example.com/").unwrap(),
+            ("example.com".into(), "80".into())
+        );
+    }
+    #[test]
+    fn http_url_keeps_an_explicit_port() {
+        assert_eq!(
+            split_host_port("http://example.com:8443/").unwrap(),
+            ("example.com".into(), "8443".into())
+        );
+    }
+    #[test]
+    fn default_http_is_only_http_on_80() {
+        assert!(is_default_http("http://example.com/", "80"));
+        assert!(!is_default_http("http://example.com:8443/", "8443"));
+        assert!(!is_default_http("https://example.com/", "443"));
+        assert!(!is_default_http("example.com:80", "80"));
     }
     #[test]
     fn ipv6_bracketed() {

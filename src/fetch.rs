@@ -3,11 +3,14 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
-use rustls_platform_verifier::BuilderVerifierExt;
+use rustls::{
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, OtherError,
+    SignatureScheme,
+};
 
 use crate::target::{Resolve, lookup_resolve};
 
@@ -106,7 +109,10 @@ fn fetch_from_addrs(
             }
             if let Err(e) = conn.process_new_packets() {
                 let _ = conn.write_tls(&mut stream);
-                return Err(format!("TLS handshake with {target} failed: {e}"));
+                return Err(format!(
+                    "TLS handshake with {target} failed: {}",
+                    describe(&e)
+                ));
             }
         } else {
             return Err(format!("TLS handshake with {target} stalled"));
@@ -152,7 +158,9 @@ fn connect(
     addrs: &[SocketAddr],
     deadline: Option<Instant>,
 ) -> Result<TcpStream, String> {
-    let mut last_err = None;
+    // Every failed address is reported: the last one alone can hide the
+    // cause, such as IPv6 unreachable while IPv4 is refused.
+    let mut failures: Vec<String> = Vec::new();
     for (i, addr) in addrs.iter().enumerate() {
         let attempt = match remaining(deadline) {
             Ok(Some(left)) => {
@@ -162,25 +170,240 @@ fn connect(
             }
             Ok(None) => TcpStream::connect(addr),
             Err(Expired) => {
-                return Err(match last_err {
-                    Some(e) => format!("connecting to {target} timed out ({e})"),
-                    None => format!("connecting to {target} timed out"),
+                return Err(if failures.is_empty() {
+                    format!("connecting to {target} timed out")
+                } else {
+                    format!("connecting to {target} timed out ({})", failures.join("; "))
                 });
             }
         };
         match attempt {
             Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(format!("failed to connect to {addr}: {e}")),
+            Err(e) => failures.push(format!("{addr}: {e}")),
         }
     }
-    Err(last_err.unwrap_or_else(|| format!("no addresses found for {target}")))
+    if failures.is_empty() {
+        Err(format!("no addresses found for {target}"))
+    } else {
+        Err(format!(
+            "failed to connect to {target} ({})",
+            failures.join("; ")
+        ))
+    }
 }
 
-pub fn platform_verifier() -> Result<Arc<dyn ServerCertVerifier>, String> {
+/// Plain wording for the TLS failures people actually hit. rustls prints many
+/// of these as bare identifiers (`UnknownIssuer`), and a wrapped OS error with
+/// Debug, burying its message in `Other(OtherError("..."))`.
+pub fn describe(e: &rustls::Error) -> String {
+    use rustls::{AlertDescription, CertificateError as C, Error, PeerIncompatible};
+    match e {
+        Error::InvalidCertificate(c) => match c {
+            C::Other(OtherError(inner)) => without_os_status(&inner.to_string()).to_string(),
+            C::NotValidForName => "the certificate is not valid for this host name".into(),
+            C::UnknownIssuer => "the certificate does not lead to a trusted root \
+                (an untrusted CA, or an intermediate that is missing or unusable)"
+                .into(),
+            C::Revoked => "the certificate has been revoked".into(),
+            C::Expired => "the certificate has expired".into(),
+            C::NotValidYet => "the certificate is not valid yet".into(),
+            C::BadSignature => "a certificate signature is invalid".into(),
+            C::BadEncoding => "a certificate is malformed".into(),
+            C::UnsupportedSignatureAlgorithmContext { .. }
+            | C::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => {
+                "a certificate uses an unsupported signature algorithm".into()
+            }
+            C::InvalidPurpose | C::InvalidPurposeContext { .. } => {
+                "the certificate is not issued for server authentication".into()
+            }
+            C::UnhandledCriticalExtension => {
+                "a certificate has a critical extension that cannot be checked".into()
+            }
+            C::UnknownRevocationStatus => "the certificate's revocation status is unknown".into(),
+            _ => e.to_string(),
+        },
+        Error::InvalidMessage(rustls::InvalidMessage::HandshakePayloadTooLarge) => {
+            "the server sent a handshake message over 64 KiB, the most this tool \
+             accepts (a certificate with very many names?)"
+                .into()
+        }
+        Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType) => {
+            "the server did not answer with TLS (a plain HTTP or other non-TLS port?)".into()
+        }
+        Error::AlertReceived(
+            alert @ (AlertDescription::HandshakeFailure
+            | AlertDescription::ProtocolVersion
+            | AlertDescription::InsufficientSecurity),
+        ) => format!(
+            "the server refused the handshake ({alert:?}); it likely offers only TLS \
+             versions or ciphers this tool does not support (TLS 1.1 or older, CBC, \
+             DHE, static RSA, RC4 or 3DES)"
+        ),
+        Error::PeerIncompatible(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig) => {
+            "the server supports only TLS 1.1 or older, which this tool does not".into()
+        }
+        Error::PeerIncompatible(
+            PeerIncompatible::NoCipherSuitesInCommon | PeerIncompatible::NoKxGroupsInCommon,
+        ) => "the server offers no cipher this tool supports".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// macOS ends its messages with the numeric OSStatus (`...: -67818`), which
+/// means nothing to the reader once the text is there.
+fn without_os_status(message: &str) -> &str {
+    match message.rsplit_once(": -") {
+        Some((text, code)) if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) => text,
+        _ => message,
+    }
+}
+
+/// The roots the OS trusts. Roots that fail to load are skipped.
+pub fn native_roots() -> Vec<CertificateDer<'static>> {
+    rustls_native_certs::load_native_certs().certs
+}
+
+/// The OS verifier, plus a second check that the server sent every
+/// intermediate. Without `roots` only the OS verifier runs.
+pub fn server_verifier(
+    roots: &[CertificateDer<'static>],
+) -> Result<Arc<dyn ServerCertVerifier>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    rustls_platform_verifier::Verifier::new(provider)
-        .map(|v| Arc::new(v) as Arc<dyn ServerCertVerifier>)
-        .map_err(|e| format!("failed to load platform verifier: {e}"))
+    let platform: Arc<dyn ServerCertVerifier> = Arc::new(
+        rustls_platform_verifier::Verifier::new(provider.clone())
+            .map_err(|e| format!("failed to load platform verifier: {e}"))?,
+    );
+    require_sent_chain(platform, roots)
+}
+
+/// Wraps `platform` with the sent-chain check against `roots`; returns
+/// `platform` unchanged when no root is usable.
+pub fn require_sent_chain(
+    platform: Arc<dyn ServerCertVerifier>,
+    roots: &[CertificateDer<'static>],
+) -> Result<Arc<dyn ServerCertVerifier>, String> {
+    let mut store = rustls::RootCertStore::empty();
+    store.add_parsable_certificates(roots.iter().cloned());
+    if store.is_empty() {
+        return Ok(platform);
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let sent_only = WebPkiServerVerifier::builder_with_provider(Arc::new(store), provider)
+        .build()
+        .map_err(|e| format!("failed to build certificate verifier: {e}"))?;
+    Ok(Arc::new(RequireSentChain {
+        platform,
+        sent_only,
+    }))
+}
+
+/// The issuer of the last certificate the server sent is neither among the
+/// sent certificates nor a trusted root.
+#[derive(Debug)]
+struct IssuerNotSent;
+
+impl std::fmt::Display for IssuerNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the server did not send an intermediate certificate \
+             (this OS fetched it, but clients that do not fetch will fail)",
+        )
+    }
+}
+
+impl std::error::Error for IssuerNotSent {}
+
+/// The sent chain holds an intermediate outside its validity period, typically
+/// an old one left in place after renewal, while the OS found a current one.
+#[derive(Debug)]
+struct SentIntermediateOutOfDate;
+
+impl std::fmt::Display for SentIntermediateOutOfDate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "an intermediate certificate the server sent is expired or not yet valid \
+             (this OS used another one, but clients that rely on the sent chain will fail)",
+        )
+    }
+}
+
+impl std::error::Error for SentIntermediateOutOfDate {}
+
+/// Some OS verifiers (macOS, Windows) fetch intermediates the server left out
+/// and pass, hiding a mistake that breaks clients which do not fetch. webpki
+/// never fetches, so running it on the sent chain alone exposes the gap.
+/// Only a missing issuer or an out-of-date certificate counts. The leaf
+/// already passed the OS verifier at the same time, so an out-of-date verdict
+/// can only be about a sent intermediate. On anything else the OS verifier,
+/// which also checks revocation, has the final say, so that differences in
+/// how the two read a certificate never turn into errors.
+#[derive(Debug)]
+struct RequireSentChain {
+    platform: Arc<dyn ServerCertVerifier>,
+    sent_only: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for RequireSentChain {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let verified = self.platform.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        match self.sent_only.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
+                Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                    OtherError(Arc::new(IssuerNotSent)),
+                )))
+            }
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::Expired
+                | CertificateError::ExpiredContext { .. }
+                | CertificateError::NotValidYet
+                | CertificateError::NotValidYetContext { .. },
+            )) => Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                OtherError(Arc::new(SentIntermediateOutOfDate)),
+            ))),
+            _ => Ok(verified),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.platform.supported_verify_schemes()
+    }
 }
 
 /// Like `fetch_with_config` with `verifier`, except that a rejected chain is
@@ -210,7 +433,8 @@ pub fn fetch_keeping_rejected(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    fetched.rejection = rejection.map(|e| format!("TLS handshake with {host}:{port} failed: {e}"));
+    fetched.rejection =
+        rejection.map(|e| format!("TLS handshake with {host}:{port} failed: {}", describe(&e)));
     Ok(fetched)
 }
 
@@ -269,24 +493,30 @@ impl ServerCertVerifier for KeepRejected {
     }
 }
 
+/// `skip_verify` false loads the OS roots on every call; `config_with_verifier`
+/// reuses a verifier built once.
 pub fn client_config(skip_verify: bool) -> Result<Arc<ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("failed to configure TLS: {e}"))?;
-    let config = if skip_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert {
-                algorithms: provider.signature_verification_algorithms,
-            }))
-            .with_no_client_auth()
+    if skip_verify {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(AcceptAnyCert {
+            algorithms: provider.signature_verification_algorithms,
+        });
+        config_with_verifier(verifier)
     } else {
-        builder
-            .with_platform_verifier()
-            .map_err(|e| format!("failed to load platform verifier: {e}"))?
-            .with_no_client_auth()
-    };
+        config_with_verifier(server_verifier(&native_roots())?)
+    }
+}
+
+pub fn config_with_verifier(
+    verifier: Arc<dyn ServerCertVerifier>,
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("failed to configure TLS: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     Ok(Arc::new(config))
 }
 
@@ -356,6 +586,103 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_millis(1800));
+    }
+
+    #[derive(Debug)]
+    struct Message;
+
+    impl std::fmt::Display for Message {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("certificate is expired")
+        }
+    }
+
+    impl std::error::Error for Message {}
+
+    #[test]
+    fn describe_unwraps_platform_errors() {
+        let e = rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(
+            Message,
+        ))));
+        assert_eq!(describe(&e), "certificate is expired");
+    }
+
+    #[test]
+    fn os_status_code_is_dropped() {
+        assert_eq!(
+            without_os_status("“a” certificate is expired: -67818"),
+            "“a” certificate is expired"
+        );
+    }
+
+    #[test]
+    fn text_without_a_status_code_is_kept() {
+        assert_eq!(without_os_status("a: -b"), "a: -b");
+        assert_eq!(without_os_status("a: -"), "a: -");
+        assert_eq!(without_os_status("plain"), "plain");
+    }
+
+    #[test]
+    fn describe_spells_out_bare_identifiers() {
+        let e = rustls::Error::InvalidCertificate(CertificateError::NotValidForName);
+        assert_eq!(
+            describe(&e),
+            "the certificate is not valid for this host name"
+        );
+        let e = rustls::Error::InvalidCertificate(CertificateError::Revoked);
+        assert_eq!(describe(&e), "the certificate has been revoked");
+    }
+
+    #[test]
+    fn describe_explains_a_non_tls_port() {
+        let e = rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType);
+        assert!(describe(&e).contains("did not answer with TLS"));
+    }
+
+    #[test]
+    fn describe_explains_an_oversized_handshake() {
+        let e = rustls::Error::InvalidMessage(rustls::InvalidMessage::HandshakePayloadTooLarge);
+        assert!(describe(&e).contains("over 64 KiB"), "{}", describe(&e));
+    }
+
+    #[test]
+    fn describe_hints_at_old_tls_on_handshake_failure() {
+        let e = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
+        assert!(
+            describe(&e).contains("TLS 1.1 or older"),
+            "{}",
+            describe(&e)
+        );
+    }
+
+    #[test]
+    fn describe_keeps_rustls_wording_for_the_rest() {
+        let e = rustls::Error::AlertReceived(rustls::AlertDescription::DecodeError);
+        assert_eq!(describe(&e), e.to_string());
+    }
+
+    #[test]
+    fn every_failed_address_is_reported() {
+        let closed = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let a = closed(crate_closed_port());
+        let b = closed(crate_closed_port());
+        let err = connect("localhost:1", &[a, b], None).unwrap_err();
+        assert!(
+            err.starts_with("failed to connect to localhost:1 ("),
+            "{err}"
+        );
+        assert!(
+            err.contains(&a.to_string()) && err.contains(&b.to_string()),
+            "{err}"
+        );
+    }
+
+    fn crate_closed_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     #[test]

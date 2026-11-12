@@ -3,11 +3,14 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cert_rs::fetch::{Options, client_config, fetch, fetch_keeping_rejected, fetch_with_config};
+use cert_rs::fetch::{
+    Options, client_config, config_with_verifier, fetch, fetch_keeping_rejected, fetch_with_config,
+    require_sent_chain,
+};
 use cert_rs::target::parse_resolve;
 use common::{
-    closed_port, make_cert, spawn_silent_listener, spawn_tls_server, spawn_tls_server_reporting,
-    spawn_tls_server_rotating,
+    closed_port, make_cert, spawn_silent_listener, spawn_tls_server, spawn_tls_server_chain,
+    spawn_tls_server_reporting, spawn_tls_server_rotating,
 };
 use rustls::pki_types::CertificateDer;
 
@@ -210,4 +213,95 @@ fn rejection_and_chain_come_from_the_same_connection() {
         fetch_keeping_rejected("localhost", &port.to_string(), &opts(false), verifier).unwrap();
     assert!(fetched.rejection.is_some());
     assert_eq!(fetched.chain[0].as_ref(), bad.as_slice());
+}
+
+const VALID: ((i32, u8, u8), (i32, u8, u8)) = ((2025, 1, 1), (2099, 1, 1));
+
+/// Root -> intermediate -> leaf for "localhost". The "platform" side trusts the
+/// intermediate, standing in for an OS that fetched the missing intermediate.
+fn fetching_os_setup() -> (
+    Vec<u8>,
+    common::Issued,
+    Vec<u8>,
+    Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) {
+    let root = common::issue("Test Root", true, VALID, None);
+    let inter = common::issue("Test Intermediate", true, VALID, Some(&root));
+    let leaf = common::issue("localhost", false, VALID, Some(&inter));
+    let inter_der = inter.der();
+    let platform = verifier_trusting(&inter_der);
+    let verifier = require_sent_chain(platform, &[CertificateDer::from(root.der())]).unwrap();
+    (inter_der, leaf, root.der(), verifier)
+}
+
+#[test]
+fn missing_intermediate_fails_even_when_the_os_fetched_it() {
+    let (_, leaf, _, verifier) = fetching_os_setup();
+    let port = spawn_tls_server_chain(vec![leaf.der()], &leaf.key).to_string();
+    let config = config_with_verifier(verifier).unwrap();
+    let err = fetch_with_config("localhost", &port, &opts(false), config)
+        .err()
+        .unwrap();
+    assert!(err.contains("did not send an intermediate"), "{err}");
+}
+
+#[test]
+fn complete_chain_passes_the_sent_chain_check() {
+    let (inter_der, leaf, _, verifier) = fetching_os_setup();
+    let port = spawn_tls_server_chain(vec![leaf.der(), inter_der], &leaf.key).to_string();
+    let config = config_with_verifier(verifier).unwrap();
+    assert!(fetch_with_config("localhost", &port, &opts(false), config).is_ok());
+}
+
+#[test]
+fn os_rejection_wins_over_the_sent_chain_check() {
+    let (inter_der, leaf, root_der, _) = fetching_os_setup();
+    let other = common::issue("Other Root", true, VALID, None);
+    let platform = verifier_trusting(&other.der());
+    let verifier = require_sent_chain(platform, &[CertificateDer::from(root_der)]).unwrap();
+    let port = spawn_tls_server_chain(vec![leaf.der(), inter_der], &leaf.key).to_string();
+    let config = config_with_verifier(verifier).unwrap();
+    let err = fetch_with_config("localhost", &port, &opts(false), config)
+        .err()
+        .unwrap();
+    assert!(err.contains("does not lead to a trusted root"), "{err}");
+}
+
+/// The intermediate as re-issued at renewal: same name and key as the old
+/// one, only the validity differs.
+fn intermediate(
+    root: &common::Issued,
+    key_der: &[u8],
+    validity: ((i32, u8, u8), (i32, u8, u8)),
+) -> common::Issued {
+    let key = rcgen::KeyPair::try_from(key_der).unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Test Intermediate");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ((y1, m1, d1), (y2, m2, d2)) = validity;
+    params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+    params.not_after = rcgen::date_time_ymd(y2, m2, d2);
+    let issuer = rcgen::Issuer::new(root.params.clone(), &root.key);
+    let cert = params.clone().signed_by(&key, &issuer).unwrap();
+    common::Issued { params, cert, key }
+}
+
+#[test]
+fn expired_intermediate_fails_even_when_the_os_used_a_current_one() {
+    let root = common::issue("Test Root", true, VALID, None);
+    let key_der = rcgen::KeyPair::generate().unwrap().serialize_der();
+    let old = intermediate(&root, &key_der, ((2020, 1, 1), (2021, 1, 1)));
+    let current = intermediate(&root, &key_der, VALID);
+    let leaf = common::issue("localhost", false, VALID, Some(&current));
+    let platform = verifier_trusting(&current.der());
+    let verifier = require_sent_chain(platform, &[CertificateDer::from(root.der())]).unwrap();
+    let port = spawn_tls_server_chain(vec![leaf.der(), old.der()], &leaf.key).to_string();
+    let config = config_with_verifier(verifier).unwrap();
+    let err = fetch_with_config("localhost", &port, &opts(false), config)
+        .err()
+        .unwrap();
+    assert!(err.contains("expired or not yet valid"), "{err}");
 }
