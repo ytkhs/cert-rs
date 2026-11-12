@@ -264,5 +264,5 @@ fn os_rejection_wins_over_the_sent_chain_check() {
     let err = fetch_with_config("localhost", &port, &opts(false), config)
         .err()
         .unwrap();
-    assert!(err.contains("issuer is not trusted"), "{err}");
+    assert!(err.contains("does not lead to a trusted root"), "{err}");
 }

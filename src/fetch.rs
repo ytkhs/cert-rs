@@ -199,10 +199,10 @@ pub fn describe(e: &rustls::Error) -> String {
     use rustls::{AlertDescription, CertificateError as C, Error, PeerIncompatible};
     match e {
         Error::InvalidCertificate(c) => match c {
-            C::Other(OtherError(inner)) => inner.to_string(),
+            C::Other(OtherError(inner)) => without_os_status(&inner.to_string()).to_string(),
             C::NotValidForName => "the certificate is not valid for this host name".into(),
-            C::UnknownIssuer => "the certificate's issuer is not trusted \
-                (an unknown CA, or an intermediate the server did not send)"
+            C::UnknownIssuer => "the certificate does not lead to a trusted root \
+                (an untrusted CA, or an intermediate that is missing or unusable)"
                 .into(),
             C::Revoked => "the certificate has been revoked".into(),
             C::Expired => "the certificate has expired".into(),
@@ -235,8 +235,9 @@ pub fn describe(e: &rustls::Error) -> String {
             | AlertDescription::ProtocolVersion
             | AlertDescription::InsufficientSecurity),
         ) => format!(
-            "the server refused the handshake ({alert:?}); it may support only \
-             TLS 1.1 or older or ciphers this tool does not offer"
+            "the server refused the handshake ({alert:?}); it likely offers only TLS \
+             versions or ciphers this tool does not support (TLS 1.1 or older, CBC, \
+             DHE, static RSA, RC4 or 3DES)"
         ),
         Error::PeerIncompatible(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig) => {
             "the server supports only TLS 1.1 or older, which this tool does not".into()
@@ -245,6 +246,15 @@ pub fn describe(e: &rustls::Error) -> String {
             PeerIncompatible::NoCipherSuitesInCommon | PeerIncompatible::NoKxGroupsInCommon,
         ) => "the server offers no cipher this tool supports".into(),
         _ => e.to_string(),
+    }
+}
+
+/// macOS ends its messages with the numeric OSStatus (`...: -67818`), which
+/// means nothing to the reader once the text is there.
+fn without_os_status(message: &str) -> &str {
+    match message.rsplit_once(": -") {
+        Some((text, code)) if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) => text,
+        _ => message,
     }
 }
 
@@ -568,6 +578,21 @@ mod tests {
             Message,
         ))));
         assert_eq!(describe(&e), "certificate is expired");
+    }
+
+    #[test]
+    fn os_status_code_is_dropped() {
+        assert_eq!(
+            without_os_status("“a” certificate is expired: -67818"),
+            "“a” certificate is expired"
+        );
+    }
+
+    #[test]
+    fn text_without_a_status_code_is_kept() {
+        assert_eq!(without_os_status("a: -b"), "a: -b");
+        assert_eq!(without_os_status("a: -"), "a: -");
+        assert_eq!(without_os_status("plain"), "plain");
     }
 
     #[test]
