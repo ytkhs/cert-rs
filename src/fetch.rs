@@ -222,6 +222,11 @@ pub fn describe(e: &rustls::Error) -> String {
             C::UnknownRevocationStatus => "the certificate's revocation status is unknown".into(),
             _ => e.to_string(),
         },
+        Error::InvalidMessage(rustls::InvalidMessage::HandshakePayloadTooLarge) => {
+            "the server sent a handshake message over 64 KiB, the most this tool \
+             accepts (a certificate with very many names?)"
+                .into()
+        }
         Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType) => {
             "the server did not answer with TLS (a plain HTTP or other non-TLS port?)".into()
         }
@@ -580,6 +585,12 @@ mod tests {
     fn describe_explains_a_non_tls_port() {
         let e = rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType);
         assert!(describe(&e).contains("did not answer with TLS"));
+    }
+
+    #[test]
+    fn describe_explains_an_oversized_handshake() {
+        let e = rustls::Error::InvalidMessage(rustls::InvalidMessage::HandshakePayloadTooLarge);
+        assert!(describe(&e).contains("over 64 KiB"), "{}", describe(&e));
     }
 
     #[test]
