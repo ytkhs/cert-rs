@@ -115,6 +115,8 @@ NotAfter:     2027-01-01 08:59:59 +0900 JST
 DaysLeft:     49
 CommonName:   example.com
 SANs:         [example.com www.example.com]
+TLS:          TLSv1.3
+Key:          EC P-256
 Error:        
 Chain:
   [0] CN=example.com
