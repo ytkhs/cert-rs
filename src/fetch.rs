@@ -158,7 +158,9 @@ fn connect(
     addrs: &[SocketAddr],
     deadline: Option<Instant>,
 ) -> Result<TcpStream, String> {
-    let mut last_err = None;
+    // Every failed address is reported: the last one alone can hide the
+    // cause, such as IPv6 unreachable while IPv4 is refused.
+    let mut failures: Vec<String> = Vec::new();
     for (i, addr) in addrs.iter().enumerate() {
         let attempt = match remaining(deadline) {
             Ok(Some(left)) => {
@@ -168,27 +170,75 @@ fn connect(
             }
             Ok(None) => TcpStream::connect(addr),
             Err(Expired) => {
-                return Err(match last_err {
-                    Some(e) => format!("connecting to {target} timed out ({e})"),
-                    None => format!("connecting to {target} timed out"),
+                return Err(if failures.is_empty() {
+                    format!("connecting to {target} timed out")
+                } else {
+                    format!("connecting to {target} timed out ({})", failures.join("; "))
                 });
             }
         };
         match attempt {
             Ok(stream) => return Ok(stream),
-            Err(e) => last_err = Some(format!("failed to connect to {addr}: {e}")),
+            Err(e) => failures.push(format!("{addr}: {e}")),
         }
     }
-    Err(last_err.unwrap_or_else(|| format!("no addresses found for {target}")))
+    if failures.is_empty() {
+        Err(format!("no addresses found for {target}"))
+    } else {
+        Err(format!(
+            "failed to connect to {target} ({})",
+            failures.join("; ")
+        ))
+    }
 }
 
-/// rustls prints a wrapped platform error with Debug, burying the OS's own
-/// message in `Other(OtherError("..."))`; this unwraps it.
+/// Plain wording for the TLS failures people actually hit. rustls prints many
+/// of these as bare identifiers (`UnknownIssuer`), and a wrapped OS error with
+/// Debug, burying its message in `Other(OtherError("..."))`.
 pub fn describe(e: &rustls::Error) -> String {
+    use rustls::{AlertDescription, CertificateError as C, Error, PeerIncompatible};
     match e {
-        rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(inner))) => {
-            format!("invalid peer certificate: {inner}")
+        Error::InvalidCertificate(c) => match c {
+            C::Other(OtherError(inner)) => inner.to_string(),
+            C::NotValidForName => "the certificate is not valid for this host name".into(),
+            C::UnknownIssuer => "the certificate's issuer is not trusted \
+                (an unknown CA, or an intermediate the server did not send)"
+                .into(),
+            C::Revoked => "the certificate has been revoked".into(),
+            C::Expired => "the certificate has expired".into(),
+            C::NotValidYet => "the certificate is not valid yet".into(),
+            C::BadSignature => "a certificate signature is invalid".into(),
+            C::BadEncoding => "a certificate is malformed".into(),
+            C::UnsupportedSignatureAlgorithmContext { .. }
+            | C::UnsupportedSignatureAlgorithmForPublicKeyContext { .. } => {
+                "a certificate uses an unsupported signature algorithm".into()
+            }
+            C::InvalidPurpose | C::InvalidPurposeContext { .. } => {
+                "the certificate is not issued for server authentication".into()
+            }
+            C::UnhandledCriticalExtension => {
+                "a certificate has a critical extension that cannot be checked".into()
+            }
+            C::UnknownRevocationStatus => "the certificate's revocation status is unknown".into(),
+            _ => e.to_string(),
+        },
+        Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType) => {
+            "the server did not answer with TLS (a plain HTTP or other non-TLS port?)".into()
         }
+        Error::AlertReceived(
+            alert @ (AlertDescription::HandshakeFailure
+            | AlertDescription::ProtocolVersion
+            | AlertDescription::InsufficientSecurity),
+        ) => format!(
+            "the server refused the handshake ({alert:?}); it may support only \
+             TLS 1.1 or older or ciphers this tool does not offer"
+        ),
+        Error::PeerIncompatible(PeerIncompatible::ServerTlsVersionIsDisabledByOurConfig) => {
+            "the server supports only TLS 1.1 or older, which this tool does not".into()
+        }
+        Error::PeerIncompatible(
+            PeerIncompatible::NoCipherSuitesInCommon | PeerIncompatible::NoKxGroupsInCommon,
+        ) => "the server offers no cipher this tool supports".into(),
         _ => e.to_string(),
     }
 }
@@ -512,16 +562,64 @@ mod tests {
         let e = rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(
             Message,
         ))));
+        assert_eq!(describe(&e), "certificate is expired");
+    }
+
+    #[test]
+    fn describe_spells_out_bare_identifiers() {
+        let e = rustls::Error::InvalidCertificate(CertificateError::NotValidForName);
         assert_eq!(
             describe(&e),
-            "invalid peer certificate: certificate is expired"
+            "the certificate is not valid for this host name"
+        );
+        let e = rustls::Error::InvalidCertificate(CertificateError::Revoked);
+        assert_eq!(describe(&e), "the certificate has been revoked");
+    }
+
+    #[test]
+    fn describe_explains_a_non_tls_port() {
+        let e = rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType);
+        assert!(describe(&e).contains("did not answer with TLS"));
+    }
+
+    #[test]
+    fn describe_hints_at_old_tls_on_handshake_failure() {
+        let e = rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure);
+        assert!(
+            describe(&e).contains("TLS 1.1 or older"),
+            "{}",
+            describe(&e)
         );
     }
 
     #[test]
-    fn describe_keeps_other_errors_as_rustls_prints_them() {
-        let e = rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer);
+    fn describe_keeps_rustls_wording_for_the_rest() {
+        let e = rustls::Error::AlertReceived(rustls::AlertDescription::DecodeError);
         assert_eq!(describe(&e), e.to_string());
+    }
+
+    #[test]
+    fn every_failed_address_is_reported() {
+        let closed = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        let a = closed(crate_closed_port());
+        let b = closed(crate_closed_port());
+        let err = connect("localhost:1", &[a, b], None).unwrap_err();
+        assert!(
+            err.starts_with("failed to connect to localhost:1 ("),
+            "{err}"
+        );
+        assert!(
+            err.contains(&a.to_string()) && err.contains(&b.to_string()),
+            "{err}"
+        );
+    }
+
+    fn crate_closed_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     #[test]
