@@ -33,6 +33,18 @@ fn days_left(c: &CertInfo) -> String {
     c.days_left.map(|d| d.to_string()).unwrap_or_default()
 }
 
+/// `EC P-256`, `RSA 2048`, `Ed25519`: a named curve already says the size.
+fn key_summary(c: &CertInfo) -> String {
+    let Some(kind) = c.key_type.as_deref() else {
+        return String::new();
+    };
+    match (c.curve.as_deref(), c.key_bits) {
+        (Some(curve), _) => format!("{kind} {curve}"),
+        (None, Some(bits)) if !kind.starts_with("Ed") => format!("{kind} {bits}"),
+        _ => kind.to_string(),
+    }
+}
+
 fn sans_list(c: &CertInfo) -> String {
     format!("[{}]", c.sans.as_deref().unwrap_or_default().join(" "))
 }
@@ -53,6 +65,11 @@ fn render_table(certs: &[CertInfo]) -> String {
         out.push_str(&format!("DaysLeft:     {}\n", days_left(c)));
         out.push_str(&format!("CommonName:   {}\n", c.common_name));
         out.push_str(&format!("SANs:         {}\n", sans_list(c)));
+        out.push_str(&format!(
+            "TLS:          {}\n",
+            c.tls_version.as_deref().unwrap_or_default()
+        ));
+        out.push_str(&format!("Key:          {}\n", key_summary(c)));
         out.push_str(&format!("Error:        {}\n", c.error));
         if let Some(chain) = &c.chain {
             out.push_str("Chain:\n");
@@ -245,17 +262,55 @@ mod tests {
     fn table() {
         assert_eq!(
             render(&[ok(), dv(), err()], Format::Table),
-            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   OV\nOrganization: Acme\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
-DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
-DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nDaysLeft:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   OV\nOrganization: Acme\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nTLS:          \nKey:          \nError:        \n\n\
+DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nTLS:          \nKey:          \nError:        \n\n\
+DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nDaysLeft:     \nCommonName:   \nSANs:         []\nTLS:          \nKey:          \nError:        boom\n\n\n"
         );
+    }
+
+    fn with_key(key_type: &str, key_bits: Option<usize>, curve: Option<&str>) -> CertInfo {
+        CertInfo {
+            tls_version: Some("TLSv1.3".into()),
+            key_type: Some(key_type.into()),
+            key_bits,
+            curve: curve.map(Into::into),
+            ..ok()
+        }
+    }
+
+    fn tls_and_key_lines(c: CertInfo) -> (String, String) {
+        let out = render(&[c], Format::Table);
+        let line = |prefix: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap()
+                .to_string()
+        };
+        (line("TLS:          "), line("Key:          "))
+    }
+
+    #[test]
+    fn table_shows_tls_version_and_key() {
+        assert_eq!(
+            tls_and_key_lines(with_key("EC", Some(256), Some("P-256"))),
+            ("TLSv1.3".to_string(), "EC P-256".to_string())
+        );
+        assert_eq!(
+            tls_and_key_lines(with_key("RSA", Some(2048), None)).1,
+            "RSA 2048"
+        );
+        assert_eq!(
+            tls_and_key_lines(with_key("Ed25519", Some(256), None)).1,
+            "Ed25519"
+        );
+        assert_eq!(tls_and_key_lines(with_key("DSA", None, None)).1, "DSA");
     }
 
     #[test]
     fn table_with_chain() {
         assert_eq!(
             render(&[chained(), err()], Format::Table),
-            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nTLS:          \nKey:          \nError:        \n\
 Chain:\n\
 \x20 [0] CN=a.example.com\n\
 \x20     Issuer:    CN=Test CA\n\
@@ -270,7 +325,7 @@ Chain:\n\
 \x20     Serial:    01\n\
 \x20     SHA256:    AA:BB\n\
 ChainCheck:   NG: [1] expired\n\n\
-DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nDaysLeft:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
+DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nDaysLeft:     \nCommonName:   \nSANs:         []\nTLS:          \nKey:          \nError:        boom\n\n\n"
         );
     }
 
@@ -309,7 +364,7 @@ bad.example |  |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
     fn table_chain_parse_failure() {
         assert_eq!(
             render(&[chain_parse_failed()], Format::Table),
-            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \nChain:\nChainCheck:   NG: bad der\n\n\n"
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nTLS:          \nKey:          \nError:        \nChain:\nChainCheck:   NG: bad der\n\n\n"
         );
     }
 
