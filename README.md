@@ -40,10 +40,10 @@ cert example.com example.org
 
 | オプション | 説明 |
 | --- | --- |
-| `-f`, `--format <table\|md\|json>` | 出力形式（既定: `table`） |
+| `-f`, `--format <table\|md\|json>` | 出力形式（既定: `table`）。table と md には期限までの日数（DaysLeft）も出る |
 | `-k`, `--skip-verify` | 証明書チェーンとホスト名の検証を行わない（ハンドシェイクの署名は検証する） |
 | `-u`, `--utc` | 日時を UTC で表示する |
-| `-s`, `--timeout <秒>` | 接続と TLS ハンドシェイクを合わせたタイムアウト秒数。DNS の名前解決は含まない。0 は上限なし（既定: 3） |
+| `-s`, `--timeout <秒>` | 接続と TLS ハンドシェイクを合わせたタイムアウト秒数。DNS の名前解決は含まない。0 は上限なし（既定: 10） |
 | `-r`, `--resolve <HOST:PORT:ADDR>` | 名前解決を上書きして ADDR に接続する（複数指定可。IPv6 は `[2001:db8::1]` のように角括弧で囲む） |
 | `--chain` | サーバーが送ってきた証明書チェーンをそのまま表示し、つながりと有効期間を検査する |
 | `--fail` | エラーかチェーンの問題があるホストが 1 つでもあれば、終了コード 1 で終わる（出力は変わらない） |
@@ -112,6 +112,7 @@ Issuer:       Example Intermediate CA
 Validation:   DV
 NotBefore:    2026-10-01 09:00:00 +0900 JST
 NotAfter:     2027-01-01 08:59:59 +0900 JST
+DaysLeft:     49
 CommonName:   example.com
 SANs:         [example.com www.example.com]
 Error:        
@@ -179,6 +180,12 @@ cert --fail example.com example.org
 | `errorKind` | エラーの種類。エラーがなければ `null`。値は下の表のとおり |
 | `chainProblems` | `--chain` のときだけ付く。チェーンの問題の配列で、問題がなければ `[]`。各要素は `index`（何番目の証明書か）、`kind`、`message` |
 | `chain[].notBeforeUtc`, `chain[].notAfterUtc` | チェーンの各証明書の有効期間（RFC 3339 の UTC） |
+| `tlsVersion` | 合意した TLS のバージョン（`TLSv1.3`、`TLSv1.2`）。接続できなかった行は `null` |
+| `cipherSuite` | 合意した暗号方式の IANA 名（例: `TLS13_AES_128_GCM_SHA256`） |
+| `keyType`, `keyBits`, `curve` | サーバー証明書の鍵の種類（`RSA`、`EC`、`Ed25519`、`Ed448`、`DSA`）と長さ。`curve` は EC のときだけ（例: `P-256`） |
+| `signatureAlgorithm` | サーバー証明書の署名方式。OpenSSL と同じ名前（例: `sha256WithRSAEncryption`、`ecdsa-with-SHA256`） |
+
+エラー行でも、`port` と、接続できた場合は `ip` が入ります。時間切れのエラー文には、`-s` で制限時間を延ばせることを添えます。
 
 `errorKind` の値:
 

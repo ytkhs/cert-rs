@@ -28,6 +28,11 @@ fn render_json(certs: &[CertInfo]) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
+/// Empty for rows without a certificate, like the other fields of an error row.
+fn days_left(c: &CertInfo) -> String {
+    c.days_left.map(|d| d.to_string()).unwrap_or_default()
+}
+
 fn sans_list(c: &CertInfo) -> String {
     format!("[{}]", c.sans.as_deref().unwrap_or_default().join(" "))
 }
@@ -45,6 +50,7 @@ fn render_table(certs: &[CertInfo]) -> String {
         }
         out.push_str(&format!("NotBefore:    {}\n", c.not_before));
         out.push_str(&format!("NotAfter:     {}\n", c.not_after));
+        out.push_str(&format!("DaysLeft:     {}\n", days_left(c)));
         out.push_str(&format!("CommonName:   {}\n", c.common_name));
         out.push_str(&format!("SANs:         {}\n", sans_list(c)));
         out.push_str(&format!("Error:        {}\n", c.error));
@@ -101,6 +107,7 @@ fn render_md(certs: &[CertInfo]) -> String {
         "Organization",
         "NotBefore",
         "NotAfter",
+        "DaysLeft",
         "CN",
         "SANs",
         "Error",
@@ -128,6 +135,7 @@ fn render_md(certs: &[CertInfo]) -> String {
             &c.organization,
             &c.not_before,
             &c.not_after,
+            &days_left(c),
             &c.common_name,
         ]
         .into_iter()
@@ -184,6 +192,12 @@ mod tests {
             days_left: Some(42),
             error: "".into(),
             error_kind: None,
+            tls_version: None,
+            cipher_suite: None,
+            key_type: None,
+            key_bits: None,
+            curve: None,
+            signature_algorithm: None,
             chain: None,
             chain_check: None,
             chain_problems: None,
@@ -231,9 +245,9 @@ mod tests {
     fn table() {
         assert_eq!(
             render(&[ok(), dv(), err()], Format::Table),
-            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   OV\nOrganization: Acme\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
-DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
-DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   OV\nOrganization: Acme\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
+DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\n\
+DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nDaysLeft:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
         );
     }
 
@@ -241,7 +255,7 @@ DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValid
     fn table_with_chain() {
         assert_eq!(
             render(&[chained(), err()], Format::Table),
-            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \n\
 Chain:\n\
 \x20 [0] CN=a.example.com\n\
 \x20     Issuer:    CN=Test CA\n\
@@ -256,7 +270,7 @@ Chain:\n\
 \x20     Serial:    01\n\
 \x20     SHA256:    AA:BB\n\
 ChainCheck:   NG: [1] expired\n\n\
-DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
+DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValidation:   \nNotBefore:    \nNotAfter:     \nDaysLeft:     \nCommonName:   \nSANs:         []\nError:        boom\n\n\n"
         );
     }
 
@@ -264,9 +278,9 @@ DomainName:   bad.example\nIP:           \nPort:         \nIssuer:       \nValid
     fn markdown_with_chain() {
         assert_eq!(
             render(&[chained(), err()], Format::Md),
-            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
-a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> |  | [0] CN=a.example.com (NotAfter: NA)<br/>[1] CN=Test CA (NotAfter: NA)<br/> | NG: [1] expired\n\
-bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | DaysLeft | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | 42 | a.example.com | a.example.com<br/>\\*.example.com<br/> |  | [0] CN=a.example.com (NotAfter: NA)<br/>[1] CN=Test CA (NotAfter: NA)<br/> | NG: [1] expired\n\
+bad.example |  |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
         );
     }
 
@@ -274,7 +288,7 @@ bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
     fn json_with_chain() {
         assert_eq!(
             render(&[chained()], Format::Json),
-            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"chain":[{"subject":"CN=a.example.com","issuer":"CN=Test CA","notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","serial":"0A1B","sha256":"AA:BB"},{"subject":"CN=Test CA","issuer":"CN=Test Root","notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","serial":"01","sha256":"AA:BB"}],"chainCheck":"NG: [1] expired","chainProblems":[{"index":1,"kind":"expired","message":"[1] expired"}]}]"#
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"tlsVersion":null,"cipherSuite":null,"keyType":null,"keyBits":null,"curve":null,"signatureAlgorithm":null,"chain":[{"subject":"CN=a.example.com","issuer":"CN=Test CA","notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","serial":"0A1B","sha256":"AA:BB"},{"subject":"CN=Test CA","issuer":"CN=Test Root","notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","serial":"01","sha256":"AA:BB"}],"chainCheck":"NG: [1] expired","chainProblems":[{"index":1,"kind":"expired","message":"[1] expired"}]}]"#
         );
     }
 
@@ -295,7 +309,7 @@ bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
     fn table_chain_parse_failure() {
         assert_eq!(
             render(&[chain_parse_failed()], Format::Table),
-            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \nChain:\nChainCheck:   NG: bad der\n\n\n"
+            "DomainName:   a.example.com\nIP:           192.0.2.1\nPort:         443\nIssuer:       Test CA\nValidation:   DV\nNotBefore:    NB\nNotAfter:     NA\nDaysLeft:     42\nCommonName:   a.example.com\nSANs:         [a.example.com *.example.com]\nError:        \nChain:\nChainCheck:   NG: bad der\n\n\n"
         );
     }
 
@@ -303,8 +317,8 @@ bad.example |  |  |  |  |  |  |  |  |  | boom |  | \n\n"
     fn markdown_chain_parse_failure() {
         assert_eq!(
             render(&[chain_parse_failed()], Format::Md),
-            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
-a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> |  |  | NG: bad der\n\n"
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | DaysLeft | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | 42 | a.example.com | a.example.com<br/>\\*.example.com<br/> |  |  | NG: bad der\n\n"
         );
     }
 
@@ -312,7 +326,7 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
     fn json_chain_parse_failure() {
         assert_eq!(
             render(&[chain_parse_failed()], Format::Json),
-            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"chain":[],"chainCheck":"NG: bad der","chainProblems":[{"index":0,"kind":"parse_error","message":"bad der"}]}]"#
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"tlsVersion":null,"cipherSuite":null,"keyType":null,"keyBits":null,"curve":null,"signatureAlgorithm":null,"chain":[],"chainCheck":"NG: bad der","chainProblems":[{"index":0,"kind":"parse_error","message":"bad der"}]}]"#
         );
     }
 
@@ -325,8 +339,8 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
         };
         assert_eq!(
             render(&[c], Format::Md),
-            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
-a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> |  | [0] CN=\\*.example.com (NotAfter: NA)<br/> | OK\n\n"
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | DaysLeft | CN | SANs | Error | Chain | ChainCheck\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | 42 | a.example.com | a.example.com<br/>\\*.example.com<br/> |  | [0] CN=\\*.example.com (NotAfter: NA)<br/> | OK\n\n"
         );
     }
 
@@ -343,7 +357,7 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
         };
         let md = render(&[c], Format::Md);
         let row = md.lines().nth(2).unwrap();
-        assert_eq!(row.matches(" | ").count(), 12, "{row}");
+        assert_eq!(row.matches(" | ").count(), 13, "{row}");
         assert!(
             row.contains(
                 "[0] O=Foo\\|Bar, OU=&lt;img src=x onerror=alert(1)&gt;, CN=a\\_b \\[x\\](y) \\`c\\` \\\\ \\~d &amp; e f (NotAfter: NA)<br/>"
@@ -366,7 +380,7 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
         let row = md.lines().nth(2).unwrap();
         assert_eq!(
             row,
-            "a.example.com | 192.0.2.1 | 443 | A\\|B | OV | &lt;b&gt;Acme&lt;/b&gt; | NB | NA | x\\_y | a\\|b.example<br/> | boom \\| &lt;script&gt;"
+            "a.example.com | 192.0.2.1 | 443 | A\\|B | OV | &lt;b&gt;Acme&lt;/b&gt; | NB | NA | 42 | x\\_y | a\\|b.example<br/> | boom \\| &lt;script&gt;"
         );
     }
 
@@ -374,9 +388,9 @@ a.example.com | 192.0.2.1 | 443 | Test CA | DV |  | NB | NA | a.example.com | a.
     fn markdown_escapes_star_in_sans() {
         assert_eq!(
             render(&[ok(), err()], Format::Md),
-            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | CN | SANs | Error\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
-a.example.com | 192.0.2.1 | 443 | Test CA | OV | Acme | NB | NA | a.example.com | a.example.com<br/>\\*.example.com<br/> | \n\
-bad.example |  |  |  |  |  |  |  |  |  | boom\n\n"
+            "DomainName | IP | Port | Issuer | Validation | Organization | NotBefore | NotAfter | DaysLeft | CN | SANs | Error\n--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---\n\
+a.example.com | 192.0.2.1 | 443 | Test CA | OV | Acme | NB | NA | 42 | a.example.com | a.example.com<br/>\\*.example.com<br/> | \n\
+bad.example |  |  |  |  |  |  |  |  |  |  | boom\n\n"
         );
     }
 
@@ -384,7 +398,7 @@ bad.example |  |  |  |  |  |  |  |  |  | boom\n\n"
     fn json() {
         assert_eq!(
             render(&[dv(), err()], Format::Json),
-            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","notBeforeUtc":null,"notAfterUtc":null,"daysLeft":null,"error":"boom","errorKind":"dns"}]"#
+            r#"[{"domainName":"a.example.com","ip":"192.0.2.1","port":"443","issuer":"Test CA","validationType":"DV","commonName":"a.example.com","sans":["a.example.com","*.example.com"],"notBefore":"NB","notAfter":"NA","notBeforeUtc":"2026-01-01T00:00:00Z","notAfterUtc":"2027-01-01T00:00:00Z","daysLeft":42,"error":"","errorKind":null,"tlsVersion":null,"cipherSuite":null,"keyType":null,"keyBits":null,"curve":null,"signatureAlgorithm":null},{"domainName":"bad.example","ip":"","port":"","issuer":"","validationType":"","commonName":"","sans":null,"notBefore":"","notAfter":"","notBeforeUtc":null,"notAfterUtc":null,"daysLeft":null,"error":"boom","errorKind":"dns","tlsVersion":null,"cipherSuite":null,"keyType":null,"keyBits":null,"curve":null,"signatureAlgorithm":null}]"#
         );
     }
 

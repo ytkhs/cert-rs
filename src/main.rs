@@ -34,7 +34,7 @@ struct Cli {
     #[arg(short = 'u', long)]
     utc: bool,
     /// Seconds allowed for connect and handshake combined, excluding DNS lookup; 0 means no limit
-    #[arg(short = 's', long, value_name = "SECONDS", default_value_t = 3)]
+    #[arg(short = 's', long, value_name = "SECONDS", default_value_t = 10)]
     timeout: u64,
     /// Connect to ADDR instead of resolving HOST for that HOST:PORT; repeatable, IPv6 ADDR in brackets
     #[arg(short = 'r', long, value_name = "HOST:PORT:ADDR", value_parser = parse_resolve)]
@@ -86,20 +86,39 @@ fn inspect(input: &str, run: &Run) -> CertInfo {
     };
     let fetched = match fetched {
         Ok(f) => f,
-        Err(e) if is_default_http(input, &port) => {
-            return error_info(
-                &host,
-                e.kind,
-                format!(
-                    "{e}; http:// URLs use port 80, so use https:// or the bare host \
-                     name to check the certificate on 443"
-                ),
-            );
-        }
-        Err(e) => return error_info(&host, e.kind, e),
+        Err(e) => return failed_row(input, &host, &port, &e, run.opts.timeout),
     };
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
-    build_row(&host, &port, &fetched.ip, &ders, fetched.rejection, run)
+    let row = build_row(&host, &port, &fetched.ip, &ders, fetched.rejection, run);
+    CertInfo {
+        port,
+        ip: fetched.ip,
+        tls_version: fetched.tls_version,
+        cipher_suite: fetched.cipher_suite,
+        ..row
+    }
+}
+
+/// A row for a host that could not be read, keeping where it was tried and
+/// pointing at the usual way out when there is one.
+fn failed_row(input: &str, host: &str, port: &str, e: &Failure, timeout: Duration) -> CertInfo {
+    let hint = if is_default_http(input, port) {
+        "; http:// URLs use port 80, so use https:// or the bare host name \
+         to check the certificate on 443"
+            .to_string()
+    } else if e.kind == ErrorKind::Timeout {
+        format!(
+            "; the limit is {}s, raise it with -s (0 means no limit)",
+            timeout.as_secs()
+        )
+    } else {
+        String::new()
+    };
+    CertInfo {
+        port: port.to_string(),
+        ip: e.ip.clone().unwrap_or_default(),
+        ..error_info(host, e.kind, format!("{e}{hint}"))
+    }
 }
 
 fn build_row(
