@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::GeneralName;
 use x509_parser::oid_registry::OidRegistry;
-use x509_parser::oid_registry::asn1_rs::{Any, Tag};
+use x509_parser::oid_registry::asn1_rs::{Any, FromDer, Integer, Tag};
 use x509_parser::parse_x509_certificate;
 use x509_parser::public_key::PublicKey;
 use x509_parser::x509::X509Name;
@@ -251,13 +251,22 @@ fn key_info(cert: &X509Certificate) -> Option<KeyInfo> {
                 curve,
             })
         }
-        PublicKey::DSA(y) => Some(KeyInfo {
+        PublicKey::DSA(_) => Some(KeyInfo {
             kind: "DSA",
-            bits: Some(bit_length(y)),
+            bits: dsa_bits(spki.algorithm.parameters.as_ref()),
             curve: None,
         }),
         _ => None,
     }
+}
+
+/// A DSA key's size is that of the prime p in its parameters
+/// (`Dss-Parms ::= SEQUENCE { p, q, g }`), not of the public value y, which
+/// is often a few bits shorter. Without parameters the size is unknown.
+fn dsa_bits(parameters: Option<&Any>) -> Option<usize> {
+    let parameters = parameters.filter(|p| p.tag() == Tag::Sequence)?;
+    let (_, p) = Integer::from_der(parameters.data).ok()?;
+    Some(bit_length(p.as_ref())).filter(|&bits| bits > 0)
 }
 
 static OIDS: LazyLock<OidRegistry<'static>> =
@@ -311,6 +320,41 @@ mod tests {
         assert_eq!(sig, "ecdsa-with-SHA256");
         let key = key_of(&rcgen::PKCS_ECDSA_P384_SHA384).0.unwrap();
         assert_eq!((key.bits, key.curve.as_deref()), (Some(384), Some("P-384")));
+    }
+
+    /// DER for `SEQUENCE { INTEGER p, INTEGER q, INTEGER g }` with a p of `p_bytes`
+    /// bytes whose top bit is set, so p is exactly `p_bytes * 8` bits.
+    fn dss_parms(p_bytes: usize) -> Vec<u8> {
+        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            match content.len() {
+                n if n < 0x80 => out.push(n as u8),
+                n if n <= 0xff => out.extend([0x81, n as u8]),
+                n => out.extend([0x82, (n >> 8) as u8, n as u8]),
+            }
+            out.extend(content);
+            out
+        }
+        let mut p = vec![0x00, 0x80];
+        p.resize(p_bytes + 1, 0x01);
+        let mut content = tlv(0x02, &p);
+        content.extend(tlv(0x02, &[0x7f; 32]));
+        content.extend(tlv(0x02, &[0x02]));
+        tlv(0x30, &content)
+    }
+
+    #[test]
+    fn dsa_size_comes_from_p_not_from_the_public_value() {
+        let der = dss_parms(256);
+        let (_, any) = Any::from_der(&der).unwrap();
+        assert_eq!(dsa_bits(Some(&any)), Some(2048));
+    }
+
+    #[test]
+    fn dsa_size_is_unknown_without_parameters() {
+        assert_eq!(dsa_bits(None), None);
+        let (_, not_a_sequence) = Any::from_der(&[0x05, 0x00]).unwrap();
+        assert_eq!(dsa_bits(Some(&not_a_sequence)), None);
     }
 
     #[test]
