@@ -23,6 +23,8 @@ impl fmt::Display for Resolve {
 /// Splits a host argument (`host`, `host:port`, `[v6]:port` or a URL) into `(host, port)`.
 pub fn split_host_port(input: &str) -> Result<(String, String), String> {
     // Not the url crate: pulling in a URL parser just to find the authority is overkill.
+    // The scheme is ignored on purpose: http:// pasted from a browser still means
+    // "check this host's certificate", so it gets 443 like https://.
     let authority = match input.split_once("://") {
         Some((_, rest)) => {
             let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -138,6 +140,13 @@ mod tests {
     fn url_without_port() {
         assert_eq!(
             split_host_port("https://example.com/path").unwrap(),
+            ("example.com".into(), "443".into())
+        );
+    }
+    #[test]
+    fn http_url_still_defaults_to_443() {
+        assert_eq!(
+            split_host_port("http://example.com/").unwrap(),
             ("example.com".into(), "443".into())
         );
     }
