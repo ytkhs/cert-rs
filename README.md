@@ -30,7 +30,7 @@ cargo install --locked --path .
 cert [OPTIONS] [HOST]...
 ```
 
-ホストは `example.com`、`example.com:8443`、`https://example.com:8443/path`、`[2001:db8::1]:443` の形式で指定できます。ポートを省略すると 443 を使います。URL のスキームは見ないので、`http://example.com/` もそのホストの 443 番の証明書を調べます。ブラウザのアドレスバーからそのまま貼り付けて使えます。
+ホストは `example.com`、`example.com:8443`、`https://example.com:8443/path`、`[2001:db8::1]:443` の形式で指定できます。ポートを省略すると 443 を使います。`http://` の URL でポートを省略すると、URL のとおり 80 番に接続します。80 番は普通 TLS で応答しないのでエラーになり、`https://` かホスト名だけで指定し直すよう案内を出します。
 
 ```
 cert example.com example.org

@@ -11,7 +11,9 @@ use cert_rs::fetch::{
     native_roots, server_verifier,
 };
 use cert_rs::output::{Format, render};
-use cert_rs::target::{Resolve, parse_resolve, split_host_port, unmatched_resolves};
+use cert_rs::target::{
+    Resolve, is_default_http, parse_resolve, split_host_port, unmatched_resolves,
+};
 use clap::{ArgAction, Parser};
 use jiff::Timestamp;
 use rustls::ClientConfig;
@@ -77,6 +79,15 @@ fn inspect(input: &str, run: &Run) -> CertInfo {
     };
     let fetched = match fetched {
         Ok(f) => f,
+        Err(e) if is_default_http(input, &port) => {
+            return error_info(
+                &host,
+                format!(
+                    "{e}; http:// URLs use port 80, so use https:// or the bare host \
+                     name to check the certificate on 443"
+                ),
+            );
+        }
         Err(e) => return error_info(&host, e),
     };
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
