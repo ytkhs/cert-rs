@@ -262,17 +262,16 @@ pub fn inspect_chain(
         );
     }
 
-    let now = now.as_second();
     for (i, cert) in certs.iter().enumerate() {
         let Ok(cert) = cert else { continue };
         let validity = cert.validity();
-        if now < validity.not_before.timestamp() {
+        if to_timestamp(validity.not_before).is_ok_and(|nb| now < nb) {
             problem(
                 i,
                 ChainProblemKind::NotYetValid,
                 format!("[{i}] not yet valid"),
             );
-        } else if now > validity.not_after.timestamp() {
+        } else if to_timestamp(validity.not_after).is_ok_and(|na| now > na) {
             problem(i, ChainProblemKind::Expired, format!("[{i}] expired"));
         }
     }

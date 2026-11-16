@@ -13,7 +13,7 @@ use rustls::{
 };
 
 use crate::error::{ErrorKind, Failure};
-use crate::target::{Resolve, lookup_resolve};
+use crate::target::{Resolve, lookup_resolve, parse_port};
 
 pub struct Options {
     pub skip_verify: bool,
@@ -71,9 +71,8 @@ fn internal(message: String) -> Failure {
 }
 
 fn resolve_addrs(host: &str, port: &str, opts: &Options) -> Result<Vec<SocketAddr>, Failure> {
-    let port_num: u16 = port
-        .parse()
-        .map_err(|_| Failure::new(ErrorKind::InvalidInput, format!("invalid port {port:?}")))?;
+    let port_num: u16 = parse_port(port)
+        .ok_or_else(|| Failure::new(ErrorKind::InvalidInput, format!("invalid port {port:?}")))?;
     if let Some(ip) = lookup_resolve(&opts.resolve, host, port) {
         return Ok(vec![SocketAddr::new(ip, port_num)]);
     }
@@ -210,7 +209,7 @@ fn connect(
     // Every failed address is reported: the last one alone can hide the
     // cause, such as IPv6 unreachable while IPv4 is refused.
     let mut failures: Vec<String> = Vec::new();
-    let mut all_timed_out = true;
+    let mut any_timed_out = false;
     for (i, addr) in addrs.iter().enumerate() {
         let attempt = match remaining(deadline) {
             Ok(Some(left)) => {
@@ -233,7 +232,7 @@ fn connect(
         match attempt {
             Ok(stream) => return Ok(stream),
             Err(e) => {
-                all_timed_out &= e.kind() == io::ErrorKind::TimedOut;
+                any_timed_out |= e.kind() == io::ErrorKind::TimedOut;
                 failures.push(format!("{addr}: {e}"));
             }
         }
@@ -244,7 +243,7 @@ fn connect(
             format!("no addresses found for {target}"),
         ));
     }
-    let kind = if all_timed_out {
+    let kind = if any_timed_out {
         ErrorKind::Timeout
     } else {
         ErrorKind::Connect
@@ -783,8 +782,8 @@ mod tests {
     #[test]
     fn every_failed_address_is_reported() {
         let closed = |port| SocketAddr::from(([127, 0, 0, 1], port));
-        let a = closed(crate_closed_port());
-        let b = closed(crate_closed_port());
+        let a = closed(closed_port());
+        let b = closed(closed_port());
         let err = connect("localhost:1", &[a, b], None).unwrap_err();
         assert!(
             err.message
@@ -798,7 +797,7 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Connect);
     }
 
-    fn crate_closed_port() -> u16 {
+    fn closed_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()

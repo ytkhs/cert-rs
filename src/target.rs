@@ -71,8 +71,26 @@ pub fn split_host_port(input: &str) -> Result<(String, String), String> {
         authority.split_once(':').unwrap_or((authority, ""))
     };
 
-    let port = if port.is_empty() { default_port } else { port };
-    Ok((host.to_string(), port.to_string()))
+    if host.is_empty() {
+        return Err(format!("missing host in address: {input}"));
+    }
+    let port = if port.is_empty() {
+        default_port.to_string()
+    } else {
+        parse_port(port)
+            .ok_or_else(|| format!("invalid port in address: {authority}"))?
+            .to_string()
+    };
+    Ok((host.to_string(), port))
+}
+
+/// Accepts decimal 1..=65535; `u16::from_str` alone would accept "+443" and "0".
+pub(crate) fn parse_port(port: &str) -> Option<u16> {
+    port.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| port.parse::<u16>().ok())
+        .flatten()
+        .filter(|&n| n >= 1)
 }
 
 /// Parses `HOST:PORT:ADDR`; an IPv6 ADDR must be bracketed.
@@ -85,10 +103,9 @@ pub fn parse_resolve(s: &str) -> Result<Resolve, String> {
         s.rsplit_once(':').ok_or_else(bad)?
     };
     let (host, port) = rest.rsplit_once(':').ok_or_else(bad)?;
-    // u16's parser alone would accept "+443" and "0".
-    if !port.bytes().all(|b| b.is_ascii_digit()) || !matches!(port.parse::<u16>(), Ok(1..)) {
-        return Err(format!("invalid port in resolve spec: {s}"));
-    }
+    let port = parse_port(port)
+        .ok_or_else(|| format!("invalid port in resolve spec: {s}"))?
+        .to_string();
     let addr = addr
         .strip_prefix('[')
         .and_then(|a| a.strip_suffix(']'))
@@ -98,7 +115,7 @@ pub fn parse_resolve(s: &str) -> Result<Resolve, String> {
         .map_err(|_| format!("invalid IP address in resolve spec: {s}"))?;
     Ok(Resolve {
         host: host.to_string(),
-        port: port.to_string(),
+        port,
         addr,
     })
 }
@@ -297,6 +314,38 @@ mod tests {
         assert_eq!(
             unmatched,
             ["example.com:8443:192.0.2.11", "example.org:443:192.0.2.12"]
+        );
+    }
+
+    #[test]
+    fn empty_host_is_error() {
+        for bad in ["", ":443", "https://", "https:///path", "[]:443"] {
+            assert!(split_host_port(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn invalid_port_in_host_is_error() {
+        for bad in [
+            "example.com:0",
+            "example.com:65536",
+            "example.com:+443",
+            "example.com:abc",
+            "[::1]:0",
+            "[::1]:abc",
+        ] {
+            assert!(split_host_port(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn leading_zero_port_is_normalized() {
+        let (host, port) = split_host_port("example.com:0443").unwrap();
+        assert_eq!((host.as_str(), port.as_str()), ("example.com", "443"));
+        let list = vec![parse_resolve("example.com:443:192.0.2.1").unwrap()];
+        assert_eq!(
+            lookup_resolve(&list, &host, &port).unwrap().to_string(),
+            "192.0.2.1"
         );
     }
 }
