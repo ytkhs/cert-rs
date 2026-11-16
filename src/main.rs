@@ -91,8 +91,6 @@ fn inspect(input: &str, run: &Run) -> CertInfo {
     let ders: Vec<&[u8]> = fetched.chain.iter().map(|c| c.as_ref()).collect();
     let row = build_row(&host, &port, &fetched.ip, &ders, fetched.rejection, run);
     CertInfo {
-        port,
-        ip: fetched.ip,
         tls_version: fetched.tls_version,
         cipher_suite: fetched.cipher_suite,
         ..row
@@ -129,8 +127,17 @@ fn build_row(
     rejection: Option<Failure>,
     run: &Run,
 ) -> CertInfo {
+    let at_endpoint = |info: CertInfo| CertInfo {
+        ip: ip.to_string(),
+        port: port.to_string(),
+        ..info
+    };
     if ders.is_empty() {
-        return error_info(host, ErrorKind::HandshakeFailed, "no certificate presented");
+        return at_endpoint(error_info(
+            host,
+            ErrorKind::HandshakeFailed,
+            "no certificate presented",
+        ));
     }
     let certs = if run.chain {
         parse_chain(ders)
@@ -156,12 +163,8 @@ fn build_row(
     let info = match leaf {
         Ok(info) => info,
         // The rest of the chain is still worth showing when only the leaf is unreadable.
-        Err(_) if run.chain => CertInfo {
-            ip: ip.to_string(),
-            port: port.to_string(),
-            ..error_info(host, ErrorKind::ParseError, "")
-        },
-        Err(e) => return error_info(host, e.kind, e),
+        Err(_) if run.chain => at_endpoint(error_info(host, ErrorKind::ParseError, "")),
+        Err(e) => return at_endpoint(error_info(host, e.kind, e)),
     };
     let info = CertInfo {
         error,
@@ -346,7 +349,8 @@ mod tests {
         };
         let ders: [&[u8]; 1] = [&[0, 1, 2, 3]];
         let row = build_row("a.example.com", "443", "192.0.2.1", &ders, None, &run);
-        assert_eq!(row.ip, "");
+        assert_eq!(row.ip, "192.0.2.1");
+        assert_eq!(row.port, "443");
         assert!(row.chain.is_none());
         assert!(!row.error.is_empty());
     }
